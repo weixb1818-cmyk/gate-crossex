@@ -56,3 +56,53 @@
 再以相同总本金比较各自拟采用的账户模式，单列净收益、峰值资金占用、因资金不足放弃的机会和人工调拨次数。这样可以判断收益差异来自策略、执行还是共享保证金。模拟结果和实际账户观测分别列示。
 
 请团队在本节下方回复首期选用的标的和场所、录盘与回放的验收方式，以及第一份逐笔成绩单将提供的字段。后续可直接附实现提交和样本报告供复审。
+
+## 四、开发团队回复与第一期确认
+
+2026-11-27 · 对应评审基线 `d046c45` · 待复审确认后进入第一期实施
+
+### 1. 对五点设计修正的确认与源码补充
+
+1. **全面采纳评审框架**：同意按「账户费率与深度成本先行、脱离页面后台录盘回放、资金与风险预算统一预留、先观测后扩功能」的三期节奏推进，不在第一期提前堆叠自动调款或换腿轮动。
+2. **退出价差口径约定（补充至第 1 点）**：资金费率策略开仓准入按当时双边可成交深度估测保守退出价差成本；短线价差收敛策略（`auto`）开仓准入若直接按同一瞬间对侧平仓定价，会因双边 BBO 点差导致数学上恒负而零触发，因此开仓准入将使用「目标止盈退出价差 + 预期退出深度冲击缓冲」作为情景假设并显式落盘记录，而逐笔成绩单事后结算统一采用实际触发退出时的可成交深度均价（期末未平仓位按可平盘口估值），盘口冲击仅计扣一次。
+3. **结算时间轴与盘口断流前置修复（补充至第 2 点与第二.1 节）**：未来结算事件按各所真实整点周期枚举（兼容 Hyperliquid/Lighter 1 小时与 Binance/OKX/Bybit/Gate 等 8 小时/4 小时周期差异）。同时，第一期脱离前端后台录盘前，将一并修补 [market-hub.ts](../apps/backend/src/market-hub.ts#L290) 仅在前端页面订阅时才监听 `order_book_update` 的问题（[FundingOverviewService](../apps/backend/src/funding-overview.ts#L45) 同样需改为独立后台采集），以及 [`applyBookUpdate`](../apps/backend/src/market-hub.ts#L631) 未校验 `U`/`u` 连续性且 WS 重连未清盘重建的问题。
+4. **挂单冻结与订单语义核实（补充至第 4 点）**：修补 [`maintainQuote`](../apps/backend/src/strategy-engine.ts#L1732) 在对冲腿行情失效（`desired === null`）时提前返回却未撤销在场 Maker 挂单的漏洞，同时修复 [`evaluate`](../apps/backend/src/strategy-engine.ts#L1408) 与 [`ensureHedged`](../apps/backend/src/strategy-engine.ts#L2024) 在 `repairCooldownMs` 退避冷却期间仍保留并继续补充 Maker 委托的同源问题。正式启用保护价 `IOC` 前，先基于 [`CrossExOrderRequestSchema`](../apps/backend/src/crossex-client.ts#L180) 对各所逐一实测确认 `LIMIT+IOC`/`MARKET+IOC` 与 `reduce_only` 语义。
+5. **观测埋点与队列隔离（补充至第 5 点）**：第一期完整记录行情接收、策略判定、入队、出队发网、回包时间戳以及分币种负债、借款成本与保证金占用；同时对照 [`drainAuthenticatedRequestQueue`](../apps/backend/src/crossex-client.ts#L642) 的串行阻塞现状，评估在不突破全局限频的前提下为高优撤单/降险保留独立容量。
+
+### 2. 首期标的和场所
+
+- **首选标的**：`ETH`（流动性与 50 档深度足够支撑 VWAP 滑点验证，合约乘数规范；如样本充足，第二组可扩展对比 `SOL`）。
+- **首选场所**：`BINANCE` + `HYPERLIQUID`（并同步旁路采集 `GATE` 资金费作为对照基准）。
+- **选择理由**：`BINANCE + HYPERLIQUID` 跨了 CEX 8 小时 USDT 永续与 DEX 1 小时 USDC 永续两种典型账户规则，既能一次性验证跨结算周期对齐与 CrossEx USDT/USDC 负债借款观测，也与 `perp tools` 覆盖重合，方便采用同一市场样本同口径对比。
+
+### 3. 录盘与回放的验收方式
+
+- **独立后台连续录盘**：在不启动/不打开浏览器前端页面的状态下，后台连续采集至少覆盖 **1 个完整 8 小时资金费结算周期**（推荐连续 24 小时），持久化双所 50 档盘口快照与增量（含价量单位、`contract_size` 归一化系数、交易所事件时间 `ts` 与本地接收时间）、原始资金费率、下一结算时间及数据源标识。
+- **断流与恢复校验**：在测试或受控回放中至少注入 1 次 WebSocket 断流重连；断流触发时立即将对应盘口状态置为 `BOOK_RESYNCING` 并拒绝一切开平仓触发，校验必须等到重新收到有效 `snapshot` 且连续 `U`/`u` 序号验证通过后才恢复可录和可用状态。
+- **同样本双版策略对比回放**：在同一段录制数据、同一成交结算模型、相同总资金与合约归一化口径下，并行运行并输出两份逐笔结果：
+  1. **基线版**：保留原一档 BBO 触发逻辑；
+  2. **增强版**：按同数量 `Q` 计算 50 档可用深度 VWAP、结合账户实际角色费率（若费率接口缺失则统一回退 VIP 0 并在逐笔记录中显式标注假设）的往返成本过滤双 Taker 版。
+- 无合格正净收益机会时如实输出 0 笔触发并保留每轮拒绝原因统计，不裁剪数据缺口与拒绝时段。
+
+### 4. 第一份逐笔成绩单字段定义
+
+每条触发记录及同批次对比摘要按以下字段输出（金额统一折算至同一结算货币 `USDT`）：
+
+| 分组 | 字段名 | 说明 |
+|---|---|---|
+| **标识与时序** | `run_id`, `strategy_version`, `opportunity_id`, `group_id` | 运行批次、版本（`bbo_v1` / `vwap_taker_v2`）、单次机会 ID 与连续同一机会归组 ID |
+| | `asset`, `long_venue`, `short_venue`, `long_symbol`, `short_symbol` | 标的、多空场所与规范化合约标识 |
+| | `trigger_ts`, `event_ts_left`, `event_ts_right`, `recv_ts_left`, `recv_ts_right` | 判定时刻、双边数据源事件时间及本地接收时间 |
+| **规模、触发与假设** | `decision`, `reject_reason` | `TRIGGERED` / `REJECTED` 及原因（深度不足 / 成本未覆盖 / 费差净收益 ≤ 0 / 盘口失步或超龄） |
+| | `budget_usdt`, `planned_qty`, `unit_multiplier_normalized` | 本金预算、计划基准资产数量 `Q` 与合约乘数归一化系数 |
+| | `fee_source`, `exit_assumption` | 费率来源（`account_api` / `vip0_fallback`）及本次退出价差情景假设说明 |
+| | `bbo_entry_spread_bps`, `vwap_entry_spread_bps`, `est_exit_spread_bps` | 触发时 BBO 价差、按 `Q` 计算的 VWAP 开仓价差及预估退出价差成本 |
+| **往返净收益拆解** | `entry_spread_pnl_usd`, `exit_spread_pnl_usd` | 按 `Q` 结算的开仓与退出价差损益（VWAP 冲击不重复扣除） |
+| | `fees_4leg_usd` | 两腿开平四笔手续费明细及合计 |
+| | `funding_events_crossed`, `funding_net_usd`, `borrowing_cost_est_usd` | 跨过的实际结算事件数、资金费净收入、期间估算借款及其他增量成本 |
+| | `roundtrip_net_pnl_usd`, `roundtrip_net_bps` | 完整往返净收益（`USDT` 与折算名义 `bps`） |
+| | `is_open_at_end`, `mark_to_close_usd` | 期末是否未平仓及按期末可平盘口深度估值的未实现净值 |
+| **延迟与风控观测** | `max_naked_leg_ms`, `rest_queue_wait_ms` | 最大单边裸腿持续时长（模拟/实盘）及 REST 队列排队等待时长 |
+| | `margin_used_est_usd`, `margin_used_actual_usd` | 模型预计保证金占用与账户实报（或按规则模拟）占用 |
+| | `book_gap_count`, `manual_intervention_count`, `manual_notes` | 盘口失步次数、人工介入次数及处置备注 |
+
