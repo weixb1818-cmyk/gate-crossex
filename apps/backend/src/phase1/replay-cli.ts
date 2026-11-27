@@ -116,7 +116,9 @@ export function renderAuditMarkdownReport(result: ReplaySuiteResult, eventsPath:
   const d = result.timelineDiagnostics;
   const firstBridge = d.binanceBridges[0] ?? null;
   const firstHlReconnect = d.hyperliquidReconnectFirstValid[0] ?? null;
-  const sampleTrade = result.rows.find((r) => r.decision === 'TRIGGERED') ?? null;
+  const sampleTrade = result.rows.find(
+    (r) => r.decision === 'TRIGGERED' && r.strategy_version === 'vwap_taker_v2' && !r.is_open_at_end,
+  ) ?? result.rows.find((r) => r.decision === 'TRIGGERED') ?? null;
 
   const lines: string[] = [
     '# Phase 1 Offline Replay & Audit Report (ETH · Binance USD-M + Hyperliquid)',

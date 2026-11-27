@@ -1440,14 +1440,14 @@ export class StreamingReplayRunner {
       }
     }
 
-    if (this.delaySampleRows.length < 300) {
+    if (this.delaySampleRows.length < 300 || (row.decision === 'TRIGGERED' && this.delaySampleRows.length < 600)) {
       this.delaySampleRows.push(row);
     }
     this.options.onFinalizedRow?.(row);
 
     const retain = this.options.retainRowsInMemory !== false;
     const cap = this.options.maxRetainedRows ?? Number.POSITIVE_INFINITY;
-    if (retain && this.totalRetainedRows < cap) {
+    if (retain && (this.totalRetainedRows < cap || (row.decision === 'TRIGGERED' && this.totalRetainedRows < cap * 2))) {
       variant.rows.push(row);
       this.totalRetainedRows += 1;
     }
