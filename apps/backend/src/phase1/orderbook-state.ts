@@ -12,6 +12,19 @@ export interface NormalizedOrderBook {
   depthAsks: number;
 }
 
+export interface OrderBookView {
+  bestBid: PriceLevel | null;
+  bestAsk: PriceLevel | null;
+  sourceTs: number;
+  recvTs: number;
+  connGen: number;
+  depthBids: number;
+  depthAsks: number;
+  walkBids(qty: string): DepthWalkResult;
+  walkAsks(qty: string): DepthWalkResult;
+  snapshot(): NormalizedOrderBook;
+}
+
 export interface BinanceDepthDeltaEvent {
   connGen: number;
   recvSeq: number;
@@ -88,26 +101,212 @@ export type BinanceSnapshotResult =
       detail: string;
     };
 
-function applyLevelUpdates(book: Map<string, string>, updates: readonly PriceLevel[]): void {
-  for (const [price, quantity] of updates) {
-    if (new Decimal(quantity).lte(0)) {
-      book.delete(price);
-    } else {
-      book.set(price, quantity);
-    }
-  }
+interface SortedEntry {
+  priceNum: number;
+  price: string;
+  qty: string;
 }
 
-function sortedLevels(book: Map<string, string>, descending: boolean): PriceLevel[] {
-  return [...book.entries()].sort((left, right) => {
-    const diff = new Decimal(left[0]).minus(right[0]);
-    if (diff.isZero()) return 0;
-    return descending ? (diff.gt(0) ? -1 : 1) : (diff.lt(0) ? -1 : 1);
-  });
+function compareSidePrices(
+  aNum: number,
+  aStr: string,
+  bNum: number,
+  bStr: string,
+  descending: boolean,
+): number {
+  if (aNum !== bNum) {
+    return descending ? (aNum > bNum ? -1 : 1) : (aNum < bNum ? -1 : 1);
+  }
+  if (aStr === bStr) return 0;
+  const cmp = new Decimal(aStr).cmp(bStr);
+  return descending ? -cmp : cmp;
+}
+
+/**
+ * Incrementally maintained sorted single-side book (`bids` desc or `asks` asc).
+ * Price-level mutations are O(log N) binary searches instead of full O(N log N)
+ * re-sorts, enabling million-event offline replays in constant low memory.
+ */
+export class SortedBookSide {
+  private readonly levels = new Map<string, string>();
+  private entries: SortedEntry[] = [];
+
+  constructor(private readonly descending: boolean) {}
+
+  clear(): void {
+    this.levels.clear();
+    this.entries = [];
+  }
+
+  clone(): SortedBookSide {
+    const copy = new SortedBookSide(this.descending);
+    for (const [k, v] of this.levels) copy.levels.set(k, v);
+    copy.entries = this.entries.map((entry) => ({ ...entry }));
+    return copy;
+  }
+
+  size(): number {
+    return this.entries.length;
+  }
+
+  best(): PriceLevel | null {
+    const first = this.entries[0];
+    return first ? [first.price, first.qty] : null;
+  }
+
+  loadSnapshot(updates: readonly PriceLevel[]): void {
+    this.levels.clear();
+    const next: SortedEntry[] = [];
+    for (const [price, qty] of updates) {
+      const qNum = Number(qty);
+      if (qty === '0' || (Number.isFinite(qNum) ? qNum <= 0 : new Decimal(qty).lte(0))) continue;
+      if (!this.levels.has(price)) {
+        next.push({ priceNum: Number(price), price, qty });
+      }
+      this.levels.set(price, qty);
+    }
+    // Deduplicate if overwritten in same snapshot array.
+    const dedup = next.length === this.levels.size
+      ? next
+      : [...this.levels.entries()].map(([price, qty]) => ({ priceNum: Number(price), price, qty }));
+    dedup.sort((a, b) => compareSidePrices(a.priceNum, a.price, b.priceNum, b.price, this.descending));
+    this.entries = dedup;
+  }
+
+  apply(updates: readonly PriceLevel[]): void {
+    for (const [price, qty] of updates) {
+      const qNum = Number(qty);
+      const isRemoval = qty === '0' || (Number.isFinite(qNum) ? qNum <= 0 : new Decimal(qty).lte(0));
+      const priceNum = Number(price);
+
+      if (isRemoval) {
+        if (!this.levels.delete(price)) continue;
+        const idx = this.findIndex(priceNum, price);
+        if (idx >= 0) this.entries.splice(idx, 1);
+        continue;
+      }
+
+      const existed = this.levels.has(price);
+      this.levels.set(price, qty);
+      if (existed) {
+        const idx = this.findIndex(priceNum, price);
+        if (idx >= 0) {
+          this.entries[idx]!.qty = qty;
+          continue;
+        }
+      }
+      const insertAt = this.findInsertionIndex(priceNum, price);
+      this.entries.splice(insertAt, 0, { priceNum, price, qty });
+    }
+  }
+
+  toPriceLevels(): PriceLevel[] {
+    return this.entries.map((entry) => [entry.price, entry.qty] as const);
+  }
+
+  walkDepth(requestedQty: string): DepthWalkResult {
+    const reqNum = Number(requestedQty);
+    if (this.entries.length > 0 && Number.isFinite(reqNum) && reqNum > 0) {
+      const first = this.entries[0]!;
+      const firstQtyNum = Number(first.qty);
+      if (Number.isFinite(firstQtyNum) && firstQtyNum >= reqNum + 1e-12 && Number(first.price) > 0) {
+        const target = new Decimal(requestedQty);
+        const dotIdx = first.price.indexOf('.');
+        const vwapPrice = dotIdx >= 0 && first.price.length - dotIdx - 1 > 8
+          ? new Decimal(first.price).toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toString()
+          : first.price;
+        return {
+          fillable: true,
+          qty: target.toString(),
+          vwapPrice,
+          worstPrice: first.price,
+          notionalQuote: target.mul(first.price).toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toString(),
+          levelsUsed: 1,
+        };
+      }
+    }
+
+    const target = new Decimal(requestedQty);
+    if (!target.isFinite() || target.lte(0)) {
+      return { fillable: false, requestedQty, maxAvailableQty: '0', visibleLevels: this.entries.length };
+    }
+    let remaining = target;
+    let totalCost = new Decimal(0);
+    let filled = new Decimal(0);
+    let worstPrice = new Decimal(0);
+    let levelsUsed = 0;
+
+    for (const entry of this.entries) {
+      const price = new Decimal(entry.price);
+      const size = new Decimal(entry.qty);
+      if (!price.gt(0) || !size.gt(0)) continue;
+      const take = Decimal.min(remaining, size);
+      totalCost = totalCost.plus(take.mul(price));
+      filled = filled.plus(take);
+      worstPrice = price;
+      levelsUsed += 1;
+      remaining = remaining.minus(take);
+      if (remaining.lte('1e-12')) {
+        return {
+          fillable: true,
+          qty: target.toString(),
+          vwapPrice: totalCost.div(target).toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toString(),
+          worstPrice: worstPrice.toString(),
+          notionalQuote: totalCost.toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toString(),
+          levelsUsed,
+        };
+      }
+    }
+
+    return {
+      fillable: false,
+      requestedQty: target.toString(),
+      maxAvailableQty: filled.toString(),
+      visibleLevels: this.entries.length,
+    };
+  }
+
+  private findIndex(priceNum: number, priceStr: string): number {
+    let lo = 0;
+    let hi = this.entries.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const cur = this.entries[mid]!;
+      const cmp = compareSidePrices(cur.priceNum, cur.price, priceNum, priceStr, this.descending);
+      if (cmp === 0) return mid;
+      if (cmp < 0) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return -1;
+  }
+
+  private findInsertionIndex(priceNum: number, priceStr: string): number {
+    let lo = 0;
+    let hi = this.entries.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const cur = this.entries[mid]!;
+      const cmp = compareSidePrices(cur.priceNum, cur.price, priceNum, priceStr, this.descending);
+      if (cmp < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
 }
 
 function toBigInt(value: string | number | bigint): bigint {
   return typeof value === 'bigint' ? value : BigInt(String(value));
+}
+
+export interface BinanceBookCheckpoint {
+  status: BinanceBookStatus;
+  connGen: number;
+  lastAppliedU: string | null;
+  lastSourceTs: number;
+  lastRecvTs: number;
+  droppedOverflowCount: number;
+  bids: PriceLevel[];
+  asks: PriceLevel[];
 }
 
 /**
@@ -121,8 +320,8 @@ export class BinanceOrderBookStateMachine {
   private pendingSnapshot: BinanceDepthSnapshotInput | null = null;
   private droppedSincePending = 0;
   private droppedOverflowCount = 0;
-  private bids = new Map<string, string>();
-  private asks = new Map<string, string>();
+  private bids = new SortedBookSide(true);
+  private asks = new SortedBookSide(false);
   private lastAppliedU: bigint | null = null;
   private lastSourceTs = 0;
   private lastRecvTs = 0;
@@ -151,6 +350,33 @@ export class BinanceOrderBookStateMachine {
       droppedOverflowCount: this.droppedOverflowCount,
       lastAppliedU: this.lastAppliedU === null ? null : this.lastAppliedU.toString(),
     };
+  }
+
+  exportCheckpoint(): BinanceBookCheckpoint {
+    return {
+      status: this.status,
+      connGen: this.connGen,
+      lastAppliedU: this.lastAppliedU === null ? null : this.lastAppliedU.toString(),
+      lastSourceTs: this.lastSourceTs,
+      lastRecvTs: this.lastRecvTs,
+      droppedOverflowCount: this.droppedOverflowCount,
+      bids: this.status === 'SYNCED' ? this.bids.toPriceLevels() : [],
+      asks: this.status === 'SYNCED' ? this.asks.toPriceLevels() : [],
+    };
+  }
+
+  restoreCheckpoint(cp: BinanceBookCheckpoint): void {
+    this.status = cp.status;
+    this.connGen = cp.connGen;
+    this.lastAppliedU = cp.lastAppliedU === null ? null : BigInt(cp.lastAppliedU);
+    this.lastSourceTs = cp.lastSourceTs;
+    this.lastRecvTs = cp.lastRecvTs;
+    this.droppedOverflowCount = cp.droppedOverflowCount;
+    this.buffer = [];
+    this.pendingSnapshot = null;
+    this.droppedSincePending = 0;
+    this.bids.loadSnapshot(cp.bids);
+    this.asks.loadSnapshot(cp.asks);
   }
 
   private pushBufferedDelta(event: BinanceDepthDeltaEvent): boolean {
@@ -227,7 +453,7 @@ export class BinanceOrderBookStateMachine {
             kind: 'bridge_failed_refetch',
             status: 'BUFFERING',
             reason: result.reason === 'snapshot_behind_buffer' ? 'first_delta_after_snapshot' : 'buffered_pu_gap',
-            snapshotLastUpdateId: snapshot ? toBigInt(snapshot.lastUpdateId).toString() : snapId.toString(),
+            snapshotLastUpdateId: toBigInt(snapshot.lastUpdateId).toString(),
             firstU: U.toString(),
             firstUFinal: u.toString(),
           };
@@ -275,8 +501,8 @@ export class BinanceOrderBookStateMachine {
       };
     }
 
-    applyLevelUpdates(this.bids, event.bids);
-    applyLevelUpdates(this.asks, event.asks);
+    this.bids.apply(event.bids);
+    this.asks.apply(event.asks);
     this.lastAppliedU = u;
     this.lastSourceTs = event.eventTime;
     this.lastRecvTs = event.recvTs;
@@ -331,14 +557,13 @@ export class BinanceOrderBookStateMachine {
       };
     }
 
-    // Valid first bridging event: U <= lastUpdateId && u >= lastUpdateId.
-    const nextBids = new Map<string, string>();
-    const nextAsks = new Map<string, string>();
-    applyLevelUpdates(nextBids, snapshot.bids);
-    applyLevelUpdates(nextAsks, snapshot.asks);
+    const nextBids = new SortedBookSide(true);
+    const nextAsks = new SortedBookSide(false);
+    nextBids.loadSnapshot(snapshot.bids);
+    nextAsks.loadSnapshot(snapshot.asks);
 
-    applyLevelUpdates(nextBids, first.bids);
-    applyLevelUpdates(nextAsks, first.asks);
+    nextBids.apply(first.bids);
+    nextAsks.apply(first.asks);
     let appliedU = firstEndU;
     let appliedCount = 1;
     let lastEvent = first;
@@ -359,8 +584,8 @@ export class BinanceOrderBookStateMachine {
           detail: `buffered pu=${evPu.toString()} != prev u=${appliedU.toString()}`,
         };
       }
-      applyLevelUpdates(nextBids, event.bids);
-      applyLevelUpdates(nextAsks, event.asks);
+      nextBids.apply(event.bids);
+      nextAsks.apply(event.asks);
       appliedU = evU;
       appliedCount += 1;
       lastEvent = event;
@@ -376,8 +601,6 @@ export class BinanceOrderBookStateMachine {
     this.pendingSnapshot = null;
     this.droppedSincePending = 0;
 
-    const sortedBids = sortedLevels(this.bids, true);
-    const sortedAsks = sortedLevels(this.asks, false);
     return {
       kind: 'bridge_ready',
       status: 'SYNCED',
@@ -393,27 +616,45 @@ export class BinanceOrderBookStateMachine {
           recvTs: first.recvTs,
         },
         appliedBufferedCount: appliedCount,
-        bidLevels: sortedBids.length,
-        askLevels: sortedAsks.length,
-        bestBid: sortedBids[0]?.[0] ?? null,
-        bestAsk: sortedAsks[0]?.[0] ?? null,
+        bidLevels: this.bids.size(),
+        askLevels: this.asks.size(),
+        bestBid: this.bids.best()?.[0] ?? null,
+        bestAsk: this.asks.best()?.[0] ?? null,
       },
     };
   }
 
-  snapshot(): NormalizedOrderBook | null {
+  view(): OrderBookView | null {
     if (this.status !== 'SYNCED') return null;
-    const bids = sortedLevels(this.bids, true);
-    const asks = sortedLevels(this.asks, false);
+    const bids = this.bids;
+    const asks = this.asks;
+    const sourceTs = this.lastSourceTs;
+    const recvTs = this.lastRecvTs;
+    const connGen = this.connGen;
     return {
-      bids,
-      asks,
-      sourceTs: this.lastSourceTs,
-      recvTs: this.lastRecvTs,
-      connGen: this.connGen,
-      depthBids: bids.length,
-      depthAsks: asks.length,
+      bestBid: bids.best(),
+      bestAsk: asks.best(),
+      sourceTs,
+      recvTs,
+      connGen,
+      depthBids: bids.size(),
+      depthAsks: asks.size(),
+      walkBids: (qty) => bids.walkDepth(qty),
+      walkAsks: (qty) => asks.walkDepth(qty),
+      snapshot: () => ({
+        bids: bids.toPriceLevels(),
+        asks: asks.toPriceLevels(),
+        sourceTs,
+        recvTs,
+        connGen,
+        depthBids: bids.size(),
+        depthAsks: asks.size(),
+      }),
     };
+  }
+
+  snapshot(): NormalizedOrderBook | null {
+    return this.view()?.snapshot() ?? null;
   }
 }
 
@@ -438,6 +679,14 @@ export type HyperliquidSnapshotResult =
       book: NormalizedOrderBook;
     };
 
+export interface HyperliquidBookCheckpoint {
+  status: HyperliquidBookStatus;
+  connGen: number;
+  lastSourceTs: number;
+  appliedInCurrentConn: number;
+  book: NormalizedOrderBook | null;
+}
+
 /**
  * Deterministic Hyperliquid L2 order book state machine. Each valid snapshot replaces
  * the full visible book (preserving exact level count without extrapolating past depth).
@@ -446,6 +695,8 @@ export class HyperliquidOrderBookStateMachine {
   private status: HyperliquidBookStatus = 'WAITING_SNAPSHOT';
   private connGen = 0;
   private lastSourceTs = 0;
+  private bids = new SortedBookSide(true);
+  private asks = new SortedBookSide(false);
   private currentBook: NormalizedOrderBook | null = null;
   private appliedInCurrentConn = 0;
 
@@ -457,10 +708,37 @@ export class HyperliquidOrderBookStateMachine {
     return this.connGen;
   }
 
+  exportCheckpoint(): HyperliquidBookCheckpoint {
+    return {
+      status: this.status,
+      connGen: this.connGen,
+      lastSourceTs: this.lastSourceTs,
+      appliedInCurrentConn: this.appliedInCurrentConn,
+      book: this.currentBook ? { ...this.currentBook } : null,
+    };
+  }
+
+  restoreCheckpoint(cp: HyperliquidBookCheckpoint): void {
+    this.status = cp.status;
+    this.connGen = cp.connGen;
+    this.lastSourceTs = cp.lastSourceTs;
+    this.appliedInCurrentConn = cp.appliedInCurrentConn;
+    this.currentBook = cp.book;
+    if (cp.book) {
+      this.bids.loadSnapshot(cp.book.bids);
+      this.asks.loadSnapshot(cp.book.asks);
+    } else {
+      this.bids.clear();
+      this.asks.clear();
+    }
+  }
+
   onConnectionOpen(connGen: number): void {
     this.connGen = connGen;
     this.status = 'WAITING_SNAPSHOT';
     this.lastSourceTs = 0;
+    this.bids.clear();
+    this.asks.clear();
     this.currentBook = null;
     this.appliedInCurrentConn = 0;
   }
@@ -487,8 +765,10 @@ export class HyperliquidOrderBookStateMachine {
       }
     }
 
-    const bids = [...input.bids].sort((a, b) => new Decimal(b[0]).minus(a[0]).toNumber());
-    const asks = [...input.asks].sort((a, b) => new Decimal(a[0]).minus(b[0]).toNumber());
+    this.bids.loadSnapshot(input.bids);
+    this.asks.loadSnapshot(input.asks);
+    const bids = this.bids.toPriceLevels();
+    const asks = this.asks.toPriceLevels();
     const firstForConnection = this.appliedInCurrentConn === 0;
     this.appliedInCurrentConn += 1;
     this.lastSourceTs = input.sourceTs;
@@ -507,6 +787,25 @@ export class HyperliquidOrderBookStateMachine {
       status: 'SYNCED',
       firstForConnection,
       book: this.currentBook,
+    };
+  }
+
+  view(): OrderBookView | null {
+    if (this.status !== 'SYNCED' || !this.currentBook) return null;
+    const book = this.currentBook;
+    const bids = this.bids;
+    const asks = this.asks;
+    return {
+      bestBid: bids.best(),
+      bestAsk: asks.best(),
+      sourceTs: book.sourceTs,
+      recvTs: book.recvTs,
+      connGen: book.connGen,
+      depthBids: book.depthBids,
+      depthAsks: book.depthAsks,
+      walkBids: (qty) => bids.walkDepth(qty),
+      walkAsks: (qty) => asks.walkDepth(qty),
+      snapshot: () => book,
     };
   }
 

@@ -278,3 +278,45 @@
 独立重跑 `vitest run apps/backend/src/phase1/phase1.test.ts`，8 项通过。开发团队第十节记录的第二代桥接与旧响应丢弃顺序符合代码和回归预期。本轮核对的是团队记录，未取得短录原始 NDJSON 或后台长录状态。
 
 第 9.3 节四项回放与报告修正仍待验收。第十节的重合时长沿用旧实现的同步口径，正式报告请按各档报价年龄重算，并以实际采到的结算记录核对覆盖。交付时附原始样本或可供复核的文件位置、断流片段、回放命令和逐笔结果。
+
+## 十二、第 9.3 节四项回放修正交付、200 万事件基准与长录中段试算
+
+针对第 9.3 节与第十一节要求，开发团队已完成全部四项离线回放引擎与报告改造（长录进程 `long-run-20261127-1428` 在后台持续未中断），关键实现与验证数据如下：
+
+### 1. 代码改动清单
+
+1. **双时间戳校验、三档敏感度重算与原始拒单计数（[replay.ts](../apps/backend/src/phase1/replay.ts)、[replay-cli.ts](../apps/backend/src/phase1/replay-cli.ts)）**
+   - `evaluateBookValidity` 同时校验 `recvTs <= lastRecv + maxRecvAge` 与 `sourceTs <= lastSource + maxSourceAge`（以及 `sourceTs <= recvTs + futureSourceToleranceMs` 与交叉/空 BBO 校验）。
+   - `AgeTierCoverageTracker` 在每个决策帧区间内严格按双腿有效期交集累积 `valid_overlap_ms`，消除静默期全时段计入。
+   - 默认 CLI 与核心配置并行输出 `hlMaxAgeMsList = 15000,10000,5000`（配对 Binance `15000 ms`）与 `entryBpsList = 2,1` 全维度汇总，`raw_reject_count` 与 `raw_reject_reasons` 均在日志节流前完成精确累加。
+2. **严格到达因果排队与期末状态显式披露（[replay.ts](../apps/backend/src/phase1/replay.ts)）**
+   - 仅当 `arrivalTs <= nextTs` 时，在下一事件修改盘口前按此前活跃盘口兑现 `pendingOrder`（同毫秒则等待同时间戳事件应用后结算），绝不预读未来深度；同策略在途期间不重复开仓。
+   - 若 `arrivalTs > endedAtMs`，明确记入 `inFlightOrdersAtEnd`（`status = IN_FLIGHT_AT_END`）；期末未平仓单若末帧不满足双腿年龄或深度条件，则计入 `unvaluedOpenPositions` 与 `unvalued_open_qty_eth`，禁止静默补价。
+   - 当 Binance 因 `sequence_gap` 触发断流重同步时，`effectiveBnStatus()` 在新连接/同连接 `bridge_ready` 成功前保持 `INVALID_GAP` 语义，保证跨断流到达的在途单准确归因 `EXEC_INVALID_BN_BOOK_INVALID_GAP`。
+3. **Hyperliquid 原币合约价差与汇兑损益隔离 + 逐腿逐次结算资金费（[replay.ts](../apps/backend/src/phase1/replay.ts)）**
+   - 分别以合约计价币种独立计算 `bn_contract_pnl_usdt`（USDT）与 `hl_contract_pnl_usdc`（USDC），仅对已实现或期末市值核算的 `hl_contract_pnl_usdc` 按平仓/期末 `USDC_USDT` 汇率折算为 `hl_contract_pnl_usdt`，`collateral_fx_pnl_usd` 显式记 `0`，消除跨期名义本金的虚假汇兑波动。
+   - `computeFundingBreakdown` 仅计入 `isHistoricalBackfill === false` 的录盘期实际结算记录，逐腿保存 `FundingLegCashflow[]`（Binance 使用 `settlementTime` 对应 `markPrice`，Hyperliquid 使用同期 `nearestOraclePriceUsdc` 与 `nearestFxUsdcUsdt`）。
+4. **`O(log N)` 增量盘口与有界内存单遍流式架构（[orderbook-state.ts](../apps/backend/src/phase1/orderbook-state.ts)、[replay.ts](../apps/backend/src/phase1/replay.ts)、[replay-cli.ts](../apps/backend/src/phase1/replay-cli.ts)、[benchmark-replay.ts](../apps/backend/src/phase1/benchmark-replay.ts)）**
+   - `SortedBookSide` 以二分查找与增量插入/删档替代全档 `.sort()`；增加按 tick 共享盘口校验、BBO 平仓早筛与共享 VWAP 净边际计算。
+   - `StreamingReplayRunner` 支持按行流式解析 NDJSON（`runPhase1ReplayStream`）、增量行汇总与 CSV 流式落盘（`onFinalizedRow` + `retainRowsInMemory`），并支持 `exportCheckpoint()` / `fromCheckpoint()` 分段断点续跑。
+
+### 2. 全仓校验与 200 万事件流式基准实测
+
+- **工程与全仓单测**：
+  - `npm run typecheck`、`npm run lint`、`npm run build:packages`、`npm run build -w apps/backend` 全部通过（0 错误）。
+  - [phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts) 扩充至 11 项（新增 9.3 专题：源/接收双校验与静默期重合裁剪、未来时间戳与交叉盘、节流前原始拒单累加、`endedAtMs` 在途单入列 `inFlightOrdersAtEnd`、USDC/USDT 1% 波动对名义本金零虚假 FX 失真、分段 `checkpoint` 续跑一致、流式 NDJSON 一致），全仓 `npm test` 全部通过（backend `235/235`、frontend `157/157`、domain `11/11`、public-data `31/31`、shared-types `14/14`）。
+- **200 万事件近长录规模基准实测**：
+  - 复现命令：`npm run phase1:benchmark -w apps/backend -- --events 2000000 --levels 1000`
+  - 实测结果：`eventsProcessed = 2,000,001`，输入文件大小 `615.67 MB`，流式回放耗时 **`145,869 ms`**（吞吐 `13,711 events/sec`），流出 `479,106` 条计分记录且 `rowsRetainedInRamCount = 0`，峰值 JS Heap **`31.79 MB`**，采样峰值 RSS **`112 MB`**，Linux 历史峰值 RSS（`VmHWM`）**`159.61 MB`**；1 万事件切半 `exportCheckpoint()` / `fromCheckpoint()` 分段续跑结果与整段全等（`segmentedCheckpointParityExact: true`）。
+
+### 3. 样本重算、长录实况与中段 403 MB 试算验证
+
+- **短录 `short-race-proof-01` 多档重算（`replay-9.3`）**：
+  - 命令：`npm run phase1:replay -w apps/backend -- --in .local-data/phase1/short-race-proof-01/events.ndjson --out .local-data/phase1/short-race-proof-01/replay-9.3`
+  - 在 `15,174 ms` 窗内，`15s` 与 `10s` HL 有效重合为 `13,205 ms`（`87.02%`），而 `5s` 档位准确缩减为 `8,867 ms`（`58.44%`）。
+- **后台 9 小时实盘长录（`.local-data/phase1/long-run-20261127-1428/events.ndjson`）实时状态与中段试算**：
+  - 后台采集进程持续运行中（已稳定录制至 `403 MB` / `485,491+` 条事件），已真实采得第 30 分钟双腿注入断流与 `connGen=2` `bridge_ready`，以及 UTC 整点 `isHistoricalBackfill: false` 实时结算资金费（`liveSettledFundingCount = 3`：含 HL 整点及 Binance 16:00 CST 整点 `markPrice="1734.64503876"` / HL `nearestOraclePriceUsdc="1735.05"` / `nearestFxUsdcUsdt="1.00126"`）。
+  - 对截至 `485,491` 事件的只读安全副本执行 9.3 流式回放试算（`total_window_ms = 6,538,355 ms ≈ 109 分钟`）：
+    - 三档重合度：`hl_15000ms_bn_15000ms` **`99.98%`**（`6,537,123 ms`），`hl_10000ms_bn_15000ms` **`78.62%`**（`5,140,761 ms`），`hl_5000ms_bn_15000ms` **`38.14%`**（`2,493,534 ms`，且触发 `39,577` 次 `HL_STALE_BOOK_SOURCE_OR_RECV` 拒单与 `4` 笔期末超龄未估值仓位）。
+    - 在 `hl_15000ms_bn_15000ms` (`entry=2 bps, delay=0ms`) 下：`bbo_v1` 触发 5 笔、已实现净亏 **`-4.443671 USD`**（`-12.7749 bps`）且期末浮亏 `-2.258426 USD`；`vwap_taker_v2` 过滤 `18,787` 次 `NET_EDGE_NOT_POSITIVE` 虚假/负期望机会后仅成交 1 笔并实现净收益 **`+0.156035 USD`**（`+1.8016 bps`，含实时资金费净额 `-0.055564 USD`）。
+- **待 9 小时完整录盘结束后的最终交付**：待 `duration-sec 32400` 自然结束后，将以同一 `replay-cli` 命令生成完整 9 小时的 `report.md`、`trades.csv` 与 `scorecard.json` 供评审最终核收。

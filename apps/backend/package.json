@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests",
     "phase1:record": "node dist/phase1/record-cli.js",
-    "phase1:replay": "node dist/phase1/replay-cli.js"
+    "phase1:replay": "node dist/phase1/replay-cli.js",
+    "phase1:benchmark": "node dist/phase1/benchmark-replay.js"
   },
   "dependencies": {
     "@fastify/cors": "10.1.0",

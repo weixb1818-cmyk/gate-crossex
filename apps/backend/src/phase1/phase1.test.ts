@@ -9,7 +9,12 @@ import {
 } from './orderbook-state.js';
 import { stripProcessProxyEnv } from './proxy-free.js';
 import { Phase1MarketRecorder } from './recorder.js';
-import { buildReplayTimeline, runPhase1Replay } from './replay.js';
+import {
+  StreamingReplayRunner,
+  evaluateBookValidity,
+  runPhase1Replay,
+  runPhase1ReplayStream,
+} from './replay.js';
 import type { RecordedMarketEvent } from './types.js';
 
 describe('Phase 1 proxy stripping', () => {
@@ -373,7 +378,7 @@ describe('Phase 1 offline replay engine', () => {
         nearestFxTs: null,
         nearestFxSource: null,
       },
-      // Exit convergence at t=3000: BN bid 1703.00, HL ask 1703.00 (exit spread = 0 bps).
+      // Exit convergence at t=3000: BN bid 1703.00 (cancel prior 1700.00 ask so book is uncrossed), HL ask 1703.00 (exit spread = 0 bps).
       {
         type: 'bn_depth_delta',
         connGen: 2,
@@ -384,8 +389,8 @@ describe('Phase 1 offline replay engine', () => {
         U: '211',
         u: '220',
         pu: '210',
-        bids: [['1703.00', '5']],
-        asks: [['1703.10', '5']],
+        bids: [['1703.00', '5'], ['1699.90', '0']],
+        asks: [['1703.10', '5'], ['1700.00', '0']],
       },
       {
         type: 'hl_l2book',
@@ -401,18 +406,18 @@ describe('Phase 1 offline replay engine', () => {
       },
     ];
 
-    const timeline = buildReplayTimeline(events);
-    expect(timeline.diagnostics.binanceBridges).toHaveLength(2);
-    expect(timeline.diagnostics.binanceGapCount).toBe(1);
-
     const suite = runPhase1Replay(events, {
       plannedQtyEth: '0.500',
-      entryBps: '3',
+      entryBpsList: ['3'],
+      hlMaxAgeMsList: [15_000],
       takeProfitBps: '0',
       scenarioExitDepthBufferBps: '1',
       delaysMs: [0, 100],
       cooldownBetweenRejectsMs: 0,
     });
+
+    expect(suite.timelineDiagnostics.binanceBridges).toHaveLength(2);
+    expect(suite.timelineDiagnostics.binanceGapCount).toBe(1);
 
     const bbo0 = suite.summaries.find((s) => s.strategy_version === 'bbo_v1' && s.delay_ms === 0)!;
     const bbo100 = suite.summaries.find((s) => s.strategy_version === 'bbo_v1' && s.delay_ms === 100)!;
@@ -420,10 +425,10 @@ describe('Phase 1 offline replay engine', () => {
 
     // bbo_v1@0ms triggered on the t=1030 fake BBO, whereas bbo_v1@100ms failed arrival at t=1130 due to gap!
     expect(bbo0.triggered_count).toBe(1);
-    expect(bbo100.reject_reasons.EXEC_BOOK_INVALID_AT_ARRIVAL).toBe(1);
+    expect(bbo100.raw_reject_reasons.EXEC_INVALID_BN_BOOK_INVALID_GAP).toBe(1);
 
     // vwap_taker_v2@0ms rejected both shallow/low-spread frames (t=1030 and t=2020), then caught t=2030 and completed roundtrip at t=3010!
-    expect(vwap0.reject_reasons.NET_EDGE_NOT_POSITIVE).toBe(2);
+    expect(vwap0.raw_reject_reasons.NET_EDGE_NOT_POSITIVE).toBe(2);
     expect(vwap0.completed_roundtrips).toBe(1);
 
     const vwapTrade = suite.rows.find(
@@ -432,14 +437,17 @@ describe('Phase 1 offline replay engine', () => {
     expect(vwapTrade.rest_queue_wait_ms).toBeNull();
     expect(vwapTrade.margin_used_actual_usd).toBeNull();
     expect(vwapTrade.funding_events_crossed).toBe(2);
+    expect(vwapTrade.funding_legs).toHaveLength(2);
     // Entry: (1706 - 1700) * 0.5 = +3.0; Exit: -(1703 - 1703) * 0.5 = 0;
-    // Funding: (0.0001 - 0.00005) * (0.5 * 1700) = +0.0425;
+    // Per-settlement Funding (settlement mark=1703, oracle=1703, fx=1):
+    //   HL short receives +0.0001 * 0.5 * 1703 = +0.08515
+    //   BN long pays     -0.00005 * 0.5 * 1703 = -0.042575  -> net = +0.042575
     // Fees: BN 0.5*(1700+1703)*0.0005 (=0.85075) + HL 0.5*(1706+1703)*0.00045 (=0.767025) = 1.617775
-    // Net PnL = 3.0 + 0.0425 - 1.617775 = 1.424725 USDT
-    expect(Number(vwapTrade.roundtrip_net_pnl_usd)).toBeCloseTo(1.424725, 5);
+    // Net PnL = 3.0 + 0.042575 - 1.617775 = 1.4248 USDT
+    expect(Number(vwapTrade.roundtrip_net_pnl_usd)).toBeCloseTo(1.4248, 5);
     expect(suite.sampleDelayComparison?.zeroMs.executable).toBe(true);
     expect(suite.sampleDelayComparison?.hundredMs.executable).toBe(false);
-    expect(suite.sampleDelayComparison?.hundredMs.rejectReason).toBe('BOOK_INVALID_AT_ARRIVAL');
+    expect(suite.sampleDelayComparison?.hundredMs.rejectReason).toBe('EXEC_INVALID_BN_BOOK_INVALID_GAP');
   });
 });
 
@@ -559,6 +567,382 @@ describe('Phase 1 recorder cross-connection snapshot race & safety guards', () =
       await expect(recorder.run()).rejects.toThrow(/Refusing to overwrite/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+function mockBookView(bestBidPrice: string, bestAskPrice: string, sourceTs: number, recvTs: number) {
+  const bestBid = [bestBidPrice, '5'] as const;
+  const bestAsk = [bestAskPrice, '5'] as const;
+  return {
+    bestBid,
+    bestAsk,
+    sourceTs,
+    recvTs,
+    connGen: 1,
+    depthBids: 1,
+    depthAsks: 1,
+    walkBids: (qty: string) => ({ fillable: true as const, qty, vwapPrice: bestBidPrice, worstPrice: bestBidPrice, notionalQuote: bestBidPrice, levelsUsed: 1 }),
+    walkAsks: (qty: string) => ({ fillable: true as const, qty, vwapPrice: bestAskPrice, worstPrice: bestAskPrice, notionalQuote: bestAskPrice, levelsUsed: 1 }),
+    snapshot: () => ({ bids: [bestBid], asks: [bestAsk], sourceTs, recvTs, connGen: 1, depthBids: 1, depthAsks: 1 }),
+  };
+}
+
+describe('Phase 1 Section 9.3 streaming, age-tier, causal, and FX isolation audits', () => {
+  it('enforces dual source+recv freshness, bounds coverage overlap across silent gaps, and rejects future/crossed books', () => {
+    const staleUnit = evaluateBookValidity(
+      mockBookView('1700.0', '1700.1', 1, 20_002),
+      20_002,
+      { maxRecvAgeMs: 5_000, maxSourceAgeMs: 5_000, futureSourceToleranceMs: 2_000 },
+      'SYNCED',
+    );
+    expect(staleUnit).toEqual({ valid: false, reason: 'STALE_BOOK_SOURCE_OR_RECV' });
+
+    const futureUnit = evaluateBookValidity(
+      mockBookView('1700.0', '1700.1', 13_000, 10_000),
+      10_000,
+      { maxRecvAgeMs: 15_000, maxSourceAgeMs: 15_000, futureSourceToleranceMs: 2_000 },
+      'SYNCED',
+    );
+    expect(futureUnit).toEqual({ valid: false, reason: 'FUTURE_SOURCE_TS_EXCEEDED' });
+
+    const crossedUnit = evaluateBookValidity(
+      mockBookView('1700.5', '1700.1', 10_000, 10_000),
+      10_000,
+      { maxRecvAgeMs: 15_000, maxSourceAgeMs: 15_000, futureSourceToleranceMs: 2_000 },
+      'SYNCED',
+    );
+    expect(crossedUnit).toEqual({ valid: false, reason: 'CROSSED_BOOK' });
+
+    // Full stream case:
+    // t=1000: BN snapshot synced (stays valid for BN max 15s -> [1000..16000])
+    // t=1000: HL snapshot synced (sourceTs=1000, recvTs=1000) -> valid [1000..16000] (15s), [1000..11000] (10s), [1000..6000] (5s)
+    // t=20000: BN delta arrives fresh, while HL is silent for 20s and next HL at t=21000 has sourceTs=1, recvTs=21000 (immediately stale!).
+    const events: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['1700.0', '5']],
+        asks: [['1700.1', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['1700.0', '5']],
+        asks: [['1700.1', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1000,
+        sourceTs: 1000,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1705.0', '5']],
+        asks: [['1705.2', '5']],
+      },
+      // Repeated BN ticks inside silence gap (to test raw reject throttling before cooldown=1000ms).
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 7,
+        recvTs: 12_000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 12_000,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [['1700.0', '5']],
+        asks: [['1700.1', '5']],
+      },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 8,
+        recvTs: 12_100,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 12_100,
+        U: '102',
+        u: '102',
+        pu: '101',
+        bids: [['1700.0', '5']],
+        asks: [['1700.1', '5']],
+      },
+      // Stale HL payload whose sourceTs=1 vs recvTs=21_000.
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 9,
+        recvTs: 21_000,
+        sourceTs: 1,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1706.0', '5']],
+        asks: [['1706.2', '5']],
+      },
+    ];
+
+    const result = runPhase1Replay(events, {
+      entryBpsList: ['1'],
+      hlMaxAgeMsList: [15_000, 10_000, 5_000],
+      delaysMs: [0],
+      cooldownBetweenRejectsMs: 1_000,
+    });
+
+    const cov15 = result.timelineDiagnostics.coverageByAgeTier.find((c) => c.age_tier === 'hl_15000ms_bn_15000ms')!;
+    const cov10 = result.timelineDiagnostics.coverageByAgeTier.find((c) => c.age_tier === 'hl_10000ms_bn_15000ms')!;
+    const cov5 = result.timelineDiagnostics.coverageByAgeTier.find((c) => c.age_tier === 'hl_5000ms_bn_15000ms')!;
+
+    expect(cov15.total_window_ms).toBe(20_100);
+    expect(cov15.hl_valid_ms).toBe(15_000);
+    expect(cov15.valid_overlap_ms).toBe(15_000);
+    expect(cov10.hl_valid_ms).toBe(10_000);
+    expect(cov10.valid_overlap_ms).toBe(10_000);
+    expect(cov5.hl_valid_ms).toBe(5_000);
+    expect(cov5.valid_overlap_ms).toBe(5_000);
+
+    // At t=12_000 and t=12_100, tier hl_5000ms had expired HL -> both counted in raw_reject_reasons despite 1000ms cooldown!
+    const sum5 = result.summaries.find((s) => s.age_tier === 'hl_5000ms_bn_15000ms' && s.strategy_version === 'vwap_taker_v2')!;
+    expect(sum5.raw_reject_reasons.HL_STALE_BOOK_SOURCE_OR_RECV).toBeGreaterThanOrEqual(2);
+    // At t=21_000, HL frame has sourceTs=1, so all tiers count HL_STALE_BOOK_SOURCE_OR_RECV!
+    const sum15 = result.summaries.find((s) => s.age_tier === 'hl_15000ms_bn_15000ms' && s.strategy_version === 'vwap_taker_v2')!;
+    expect(sum15.raw_reject_reasons.HL_STALE_BOOK_SOURCE_OR_RECV).toBeGreaterThanOrEqual(1);
+  });
+
+  it('records end-of-window pending orders in inFlightOrdersAtEnd instead of fabricating end-book fills', () => {
+    const events: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['1700.0', '5']],
+        asks: [['1700.1', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['1700.0', '5']],
+        asks: [['1700.1', '5']],
+      },
+      // Last event in file at t=20002 creates a huge spread -> delay=100ms matures at t=20102 > endedAtMs (20002)!
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 20_002,
+        sourceTs: 20_000,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1710.0', '5']],
+        asks: [['1710.2', '5']],
+      },
+    ];
+
+    const result = runPhase1Replay(events, {
+      bnMaxRecvAgeMs: 30_000,
+      bnMaxSourceAgeMs: 30_000,
+      hlMaxAgeMsList: [15_000],
+      entryBpsList: ['2'],
+      delaysMs: [0, 100],
+    });
+
+    const sum100 = result.summaries.find((s) => s.strategy_version === 'vwap_taker_v2' && s.delay_ms === 100)!;
+    expect(sum100.triggered_count).toBe(0);
+    expect(sum100.in_flight_at_end_count).toBe(1);
+
+    const inflight = result.inFlightOrdersAtEnd.find(
+      (f) => f.strategy_version === 'vwap_taker_v2' && f.delay_ms === 100,
+    )!;
+    expect(inflight).toMatchObject({
+      kind: 'ENTRY',
+      decision_ts: 20_002,
+      expected_arrival_ts: 20_102,
+      ended_at_ms: 20_002,
+      status: 'IN_FLIGHT_AT_END',
+    });
+  });
+
+  it('isolates native HL contract spread PnL from USDC/USDT collateral FX swings and matches segmented checkpoint replay', async () => {
+    const events: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1.00', source: 'binance_spot_ticker' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['1699.9', '5']],
+        asks: [['1700.0', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['1699.9', '5']],
+        asks: [['1700.0', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1010,
+        sourceTs: 1005,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1706.0', '5']],
+        asks: [['1706.2', '5']],
+      },
+      // Historical backfill funding must be ignored; only live settled counts!
+      {
+        type: 'funding_settled',
+        venue: 'HYPERLIQUID',
+        recvSeq: 7,
+        recvTs: 1100,
+        source: 'hl_funding_history_api',
+        symbol: 'ETH',
+        settlementTime: 1050,
+        isHistoricalBackfill: true,
+        fundingRate: '0.005',
+        markPrice: null,
+        premium: '0',
+        nearestOraclePriceUsdc: '1703',
+        nearestOraclePriceTs: 1050,
+        nearestFxUsdcUsdt: '1.00',
+        nearestFxTs: 900,
+        nearestFxSource: 'binance_spot_ticker',
+      },
+      // FX moves +1% before exit:
+      // Entry: Long BN @1700.0, Short HL @1706.0 (fx=1.00);
+      // Exit: Short BN @1720.0 (bn_contract_pnl=+10.0 USDT), Long HL @1701.0 (hl_contract_pnl_usdc=+2.5 USDC, *1.01=+2.525 USDT).
+      // Only realized USDC contract PnL (+2.5) uses settlement FX 1.01; notional (853 USDC) creates ZERO phantom FX PnL!
+      { type: 'fx_rate', recvSeq: 8, recvTs: 1900, pair: 'USDC_USDT', rate: '1.01', source: 'binance_spot_ticker' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 9,
+        recvTs: 2000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1995,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [['1720.0', '5'], ['1699.9', '0']],
+        asks: [['1720.1', '5'], ['1700.0', '0']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 10,
+        recvTs: 2010,
+        sourceTs: 2005,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1700.9', '5']],
+        asks: [['1701.0', '5']],
+      },
+    ];
+
+    const fullResult = runPhase1Replay(events, {
+      plannedQtyEth: '0.500',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      scenarioExitDepthBufferBps: '1',
+      delaysMs: [0],
+    });
+
+    const trade = fullResult.rows.find((r) => r.strategy_version === 'vwap_taker_v2' && r.decision === 'TRIGGERED')!;
+    expect(trade.is_open_at_end).toBe(false);
+    expect(trade.bn_contract_pnl_usdt).toBe('10');
+    expect(trade.hl_contract_pnl_usdc).toBe('2.5');
+    expect(trade.hl_contract_pnl_usdt).toBe('2.525');
+    expect(trade.contract_spread_pnl_usd).toBe('12.525');
+    expect(trade.collateral_fx_pnl_usd).toBe('0');
+    expect(trade.funding_events_crossed).toBe(0);
+
+    // Segmented checkpoint parity + NDJSON streaming parity:
+    const midpoint = 5;
+    const seg1 = new StreamingReplayRunner({
+      plannedQtyEth: '0.500',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      scenarioExitDepthBufferBps: '1',
+      delaysMs: [0],
+    });
+    for (const ev of events.slice(0, midpoint)) seg1.processEvent(ev);
+    const savedCheckpoint = JSON.parse(JSON.stringify(seg1.exportCheckpoint()));
+    const seg2 = StreamingReplayRunner.fromCheckpoint(savedCheckpoint);
+    for (const ev of events.slice(midpoint)) seg2.processEvent(ev);
+    const segmentedResult = seg2.finalize();
+
+    const normalizeRunId = (rows: typeof fullResult.rows) => rows.map((r) => ({ ...r, run_id: 'normalized' }));
+    expect(segmentedResult.summaries).toEqual(fullResult.summaries);
+    expect(normalizeRunId(segmentedResult.rows)).toEqual(normalizeRunId(fullResult.rows));
+    expect(segmentedResult.timelineDiagnostics.coverageByAgeTier).toEqual(
+      fullResult.timelineDiagnostics.coverageByAgeTier,
+    );
+    expect(segmentedResult.inFlightOrdersAtEnd).toEqual(fullResult.inFlightOrdersAtEnd);
+
+    const tmpDir = mkdtempSync(join(tmpdir(), 'phase1-stream-test-'));
+    try {
+      const ndjsonPath = join(tmpDir, 'events.ndjson');
+      writeFileSync(ndjsonPath, `${events.map((e) => JSON.stringify(e)).join('\n')}\n`);
+      const streamedResult = await runPhase1ReplayStream(ndjsonPath, {
+        plannedQtyEth: '0.500',
+        entryBpsList: ['2'],
+        hlMaxAgeMsList: [15_000],
+        takeProfitBps: '0',
+        scenarioExitDepthBufferBps: '1',
+        delaysMs: [0],
+      });
+      expect(streamedResult.summaries).toEqual(fullResult.summaries);
+      expect(normalizeRunId(streamedResult.rows)).toEqual(normalizeRunId(fullResult.rows));
+      expect(streamedResult.timelineDiagnostics.coverageByAgeTier).toEqual(
+        fullResult.timelineDiagnostics.coverageByAgeTier,
+      );
+      expect(streamedResult.inFlightOrdersAtEnd).toEqual(fullResult.inFlightOrdersAtEnd);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
