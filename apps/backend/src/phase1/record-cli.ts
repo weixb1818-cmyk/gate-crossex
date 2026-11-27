@@ -15,14 +15,21 @@ async function main(): Promise<void> {
   const injectDisconnectAtMs = injectDisconnectSecRaw !== undefined
     ? Number(injectDisconnectSecRaw) * 1_000
     : undefined;
+  const injectDelayedMsRaw = readArg(args, '--inject-delayed-conn1-snapshot-ms');
+  const injectDelayedConn1SnapshotMs = injectDelayedMsRaw !== undefined
+    ? Number(injectDelayedMsRaw)
+    : undefined;
   const pollSecRaw = readArg(args, '--funding-poll-sec');
   const fundingPollIntervalMs = pollSecRaw !== undefined ? Number(pollSecRaw) * 1_000 : undefined;
+  const overwrite = args.includes('--overwrite');
   const noCrossex = args.includes('--no-crossex');
 
   const recorder = new Phase1MarketRecorder({
     outputDir,
+    overwrite,
     ...(durationMs !== undefined ? { durationMs } : {}),
     ...(injectDisconnectAtMs !== undefined ? { injectDisconnectAtMs } : {}),
+    ...(injectDelayedConn1SnapshotMs !== undefined ? { injectDelayedConn1SnapshotMs } : {}),
     ...(fundingPollIntervalMs !== undefined ? { fundingPollIntervalMs } : {}),
     includeCrossexBypass: !noCrossex,
   });

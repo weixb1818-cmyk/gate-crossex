@@ -54,7 +54,7 @@ export interface BinanceBridgeProof {
 }
 
 export type BinanceDeltaResult =
-  | { kind: 'buffered'; status: BinanceBookStatus; bufferLength: number }
+  | { kind: 'buffered'; status: BinanceBookStatus; bufferLength: number; overflowDropped: boolean }
   | { kind: 'applied'; status: 'SYNCED'; u: string }
   | { kind: 'duplicate_ignored'; status: 'SYNCED'; u: string; lastAppliedU: string }
   | { kind: 'stale_connection_ignored'; status: BinanceBookStatus }
@@ -120,11 +120,14 @@ export class BinanceOrderBookStateMachine {
   private buffer: BinanceDepthDeltaEvent[] = [];
   private pendingSnapshot: BinanceDepthSnapshotInput | null = null;
   private droppedSincePending = 0;
+  private droppedOverflowCount = 0;
   private bids = new Map<string, string>();
   private asks = new Map<string, string>();
   private lastAppliedU: bigint | null = null;
   private lastSourceTs = 0;
   private lastRecvTs = 0;
+
+  constructor(private readonly maxBufferLength = 5_000) {}
 
   getState(): BinanceBookStatus {
     return this.status;
@@ -132,6 +135,33 @@ export class BinanceOrderBookStateMachine {
 
   getConnectionGeneration(): number {
     return this.connGen;
+  }
+
+  getDiagnostics(): {
+    status: BinanceBookStatus;
+    connGen: number;
+    bufferLength: number;
+    droppedOverflowCount: number;
+    lastAppliedU: string | null;
+  } {
+    return {
+      status: this.status,
+      connGen: this.connGen,
+      bufferLength: this.buffer.length,
+      droppedOverflowCount: this.droppedOverflowCount,
+      lastAppliedU: this.lastAppliedU === null ? null : this.lastAppliedU.toString(),
+    };
+  }
+
+  private pushBufferedDelta(event: BinanceDepthDeltaEvent): boolean {
+    let overflowed = false;
+    while (this.buffer.length >= this.maxBufferLength) {
+      this.buffer.shift();
+      this.droppedOverflowCount += 1;
+      overflowed = true;
+    }
+    this.buffer.push(event);
+    return overflowed;
   }
 
   onConnectionOpen(connGen: number): void {
@@ -169,11 +199,11 @@ export class BinanceOrderBookStateMachine {
         const U = toBigInt(event.U);
         if (u < snapId) {
           this.droppedSincePending += 1;
-          return { kind: 'buffered', status: 'BUFFERING', bufferLength: this.buffer.length };
+          return { kind: 'buffered', status: 'BUFFERING', bufferLength: this.buffer.length, overflowDropped: false };
         }
         if (U > snapId) {
           this.pendingSnapshot = null;
-          this.buffer.push(event);
+          this.pushBufferedDelta(event);
           return {
             kind: 'bridge_failed_refetch',
             status: 'BUFFERING',
@@ -183,7 +213,7 @@ export class BinanceOrderBookStateMachine {
             firstUFinal: u.toString(),
           };
         }
-        this.buffer.push(event);
+        const overflowed = this.pushBufferedDelta(event);
         const snapshot = this.pendingSnapshot;
         const dropped = this.droppedSincePending;
         this.pendingSnapshot = null;
@@ -202,10 +232,10 @@ export class BinanceOrderBookStateMachine {
             firstUFinal: u.toString(),
           };
         }
-        return { kind: 'buffered', status: 'BUFFERING', bufferLength: this.buffer.length };
+        return { kind: 'buffered', status: 'BUFFERING', bufferLength: this.buffer.length, overflowDropped: overflowed };
       }
-      this.buffer.push(event);
-      return { kind: 'buffered', status: 'BUFFERING', bufferLength: this.buffer.length };
+      const overflowed = this.pushBufferedDelta(event);
+      return { kind: 'buffered', status: 'BUFFERING', bufferLength: this.buffer.length, overflowDropped: overflowed };
     }
 
     const u = toBigInt(event.u);

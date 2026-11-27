@@ -43,6 +43,7 @@ export interface RecorderEndpointsConfig {
   binanceRestDepthUrl: string;
   binancePremiumIndexUrl: string;
   binanceFundingRateUrl: string;
+  binanceFundingInfoUrl: string;
   binanceExchangeInfoUrl: string;
   hyperliquidWsUrl: string;
   hyperliquidInfoUrl: string;
@@ -104,7 +105,14 @@ export interface BinanceBookStateRecorded {
   connGen: number;
   recvSeq: number;
   recvTs: number;
-  event: 'bridge_ready' | 'bridge_failed_refetch' | 'sequence_gap' | 'resync_started' | 'duplicate_ignored';
+  event:
+    | 'bridge_ready'
+    | 'bridge_failed_refetch'
+    | 'sequence_gap'
+    | 'resync_started'
+    | 'duplicate_ignored'
+    | 'stale_snapshot_ignored'
+    | 'buffer_overflow';
   detail: Record<string, unknown> | BinanceBridgeProof;
 }
 
@@ -152,8 +160,10 @@ export interface FundingPredictionRecorded {
   source: 'bn_premium_index' | 'hl_meta_ctx';
   symbol: string;
   fundingRate: string;
-  nextFundingTime: number;
-  intervalHours: number;
+  nextFundingTime: number | null;
+  nextFundingTimeSource: 'api_premium_index' | 'derived_utc_hour' | 'missing';
+  intervalHours: number | null;
+  intervalSource: 'api_funding_info' | 'protocol_hourly_spec' | 'missing';
   markPrice: string;
   indexOrOraclePrice: string;
 }
@@ -166,8 +176,15 @@ export interface FundingSettledRecorded {
   source: 'bn_funding_rate_api' | 'hl_funding_history_api';
   symbol: string;
   settlementTime: number;
+  isHistoricalBackfill: boolean;
   fundingRate: string;
-  referencePriceOrPremium: string | null;
+  markPrice: string | null;
+  premium: string | null;
+  nearestOraclePriceUsdc: string | null;
+  nearestOraclePriceTs: number | null;
+  nearestFxUsdcUsdt: string | null;
+  nearestFxTs: number | null;
+  nearestFxSource: FxRateRecorded['source'] | null;
 }
 
 export interface FxRateRecorded {

@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   BinanceOrderBookStateMachine,
@@ -5,6 +8,7 @@ import {
   walkOrderBookDepth,
 } from './orderbook-state.js';
 import { stripProcessProxyEnv } from './proxy-free.js';
+import { Phase1MarketRecorder } from './recorder.js';
 import { buildReplayTimeline, runPhase1Replay } from './replay.js';
 import type { RecordedMarketEvent } from './types.js';
 
@@ -341,8 +345,15 @@ describe('Phase 1 offline replay engine', () => {
         source: 'hl_funding_history_api',
         symbol: 'ETH',
         settlementTime: 2500,
+        isHistoricalBackfill: false,
         fundingRate: '0.0001',
-        referencePriceOrPremium: '0',
+        markPrice: null,
+        premium: '0',
+        nearestOraclePriceUsdc: '1703',
+        nearestOraclePriceTs: 2505,
+        nearestFxUsdcUsdt: '1',
+        nearestFxTs: 900,
+        nearestFxSource: 'parity_fallback',
       },
       {
         type: 'funding_settled',
@@ -352,8 +363,15 @@ describe('Phase 1 offline replay engine', () => {
         source: 'bn_funding_rate_api',
         symbol: 'ETHUSDT',
         settlementTime: 2500,
+        isHistoricalBackfill: false,
         fundingRate: '0.00005',
-        referencePriceOrPremium: '1703',
+        markPrice: '1703',
+        premium: null,
+        nearestOraclePriceUsdc: null,
+        nearestOraclePriceTs: null,
+        nearestFxUsdcUsdt: null,
+        nearestFxTs: null,
+        nearestFxSource: null,
       },
       // Exit convergence at t=3000: BN bid 1703.00, HL ask 1703.00 (exit spread = 0 bps).
       {
@@ -422,5 +440,125 @@ describe('Phase 1 offline replay engine', () => {
     expect(suite.sampleDelayComparison?.zeroMs.executable).toBe(true);
     expect(suite.sampleDelayComparison?.hundredMs.executable).toBe(false);
     expect(suite.sampleDelayComparison?.hundredMs.rejectReason).toBe('BOOK_INVALID_AT_ARRIVAL');
+  });
+});
+
+describe('Phase 1 recorder cross-connection snapshot race & safety guards', () => {
+  it('allows new connection generation to request snapshot and bridge while delayed connGen=1 response is still pending', async () => {
+    const requestedConnGens: number[] = [];
+    const emittedEvents: RecordedMarketEvent[] = [];
+    let releaseConn1!: (value: {
+      lastUpdateId: string;
+      bids: Array<[string, string]>;
+      asks: Array<[string, string]>;
+    }) => void;
+    let releaseConn2!: (value: {
+      lastUpdateId: string;
+      bids: Array<[string, string]>;
+      asks: Array<[string, string]>;
+    }) => void;
+
+    const recorder = new Phase1MarketRecorder({
+      outputDir: '/tmp/unused-unit-test-dir',
+      binanceDepthSnapshotFetcher: (_url, connGen) => {
+        requestedConnGens.push(connGen);
+        return new Promise((resolve) => {
+          if (connGen === 1) releaseConn1 = resolve;
+          else releaseConn2 = resolve;
+        });
+      },
+      onEvent: (event) => emittedEvents.push(event),
+    });
+
+    // ConnGen 1 opens and fires delayed REST request #1.
+    recorder.onBinanceConnectionOpened(1, 0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(requestedConnGens).toEqual([1]);
+    expect(recorder.getBinanceSnapshotRequestCountForGeneration(1)).toBe(true);
+
+    // Rotate to connGen 2 while connGen 1's snapshot is still in flight!
+    recorder.onBinanceConnectionOpened(2, 0);
+    recorder.handleBinanceDepthPayload(2, {
+      e: 'depthUpdate',
+      E: 2000,
+      U: '500',
+      u: '510',
+      pu: '499',
+      b: [['1750.00', '4']],
+      a: [['1750.20', '4']],
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    // ConnGen 2 MUST NOT be swallowed by connGen 1's in-flight request.
+    expect(requestedConnGens).toEqual([1, 2]);
+    expect(recorder.getBinanceBookState().status).toBe('BUFFERING');
+
+    // ConnGen 2 snapshot returns first and bridges connGen 2 cleanly to SYNCED.
+    releaseConn2({
+      lastUpdateId: '505',
+      bids: [['1749.90', '2']],
+      asks: [['1750.30', '2']],
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(recorder.getBinanceBookState()).toMatchObject({
+      status: 'SYNCED',
+      connGen: 2,
+      lastAppliedU: '510',
+    });
+
+    // Delayed connGen 1 snapshot finally arrives after reconnect; must be ignored cleanly.
+    releaseConn1({
+      lastUpdateId: '100',
+      bids: [['1700.00', '1']],
+      asks: [['1701.00', '1']],
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(recorder.getBinanceBookState()).toMatchObject({
+      status: 'SYNCED',
+      connGen: 2,
+      lastAppliedU: '510',
+    });
+    expect(emittedEvents.some(
+      (ev) => ev.type === 'bn_book_state' && ev.event === 'stale_snapshot_ignored' && ev.connGen === 1,
+    )).toBe(true);
+    expect(emittedEvents.some(
+      (ev) => ev.type === 'bn_book_state' && ev.event === 'bridge_ready' && ev.connGen === 2,
+    )).toBe(true);
+    await recorder.stop();
+  });
+
+  it('bounds Binance pre-snapshot buffer size and counts overflowed deltas', () => {
+    const machine = new BinanceOrderBookStateMachine(3);
+    machine.onConnectionOpen(1);
+    for (let i = 1; i <= 5; i += 1) {
+      machine.onDepthDelta({
+        connGen: 1,
+        recvSeq: i,
+        recvTs: 1000 + i,
+        eventTime: 1000 + i,
+        U: String(100 + i),
+        u: String(100 + i),
+        pu: String(99 + i),
+        bids: [['1700.00', '1']],
+        asks: [],
+      });
+    }
+    expect(machine.getDiagnostics()).toMatchObject({
+      status: 'BUFFERING',
+      bufferLength: 3,
+      droppedOverflowCount: 2,
+    });
+  });
+
+  it('refuses to overwrite existing capture files unless overwrite is true', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'phase1-overwrite-guard-'));
+    try {
+      writeFileSync(join(dir, 'events.ndjson'), '{"existing":true}\n');
+      const recorder = new Phase1MarketRecorder({ outputDir: dir });
+      await expect(recorder.run()).rejects.toThrow(/Refusing to overwrite/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { mkdirSync, createWriteStream, writeFileSync, type WriteStream } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, writeFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { Decimal } from 'decimal.js';
 import WebSocket from 'ws';
@@ -11,6 +11,7 @@ import { stripProcessProxyEnv } from './proxy-free.js';
 import type {
   CaptureCatalogMeta,
   CrossExSymbolRuleMeta,
+  FxRateRecorded,
   RecordedMarketEvent,
   RecorderEndpointsConfig,
 } from './types.js';
@@ -21,6 +22,7 @@ export const DEFAULT_PHASE1_ENDPOINTS: RecorderEndpointsConfig = {
   binanceRestDepthUrl: 'https://fapi.binance.com/fapi/v1/depth?symbol=ETHUSDT&limit=1000',
   binancePremiumIndexUrl: 'https://fapi.binance.com/fapi/v1/premiumIndex?symbol=ETHUSDT',
   binanceFundingRateUrl: 'https://fapi.binance.com/fapi/v1/fundingRate?symbol=ETHUSDT&limit=30',
+  binanceFundingInfoUrl: 'https://fapi.binance.com/fapi/v1/fundingInfo',
   binanceExchangeInfoUrl: 'https://fapi.binance.com/fapi/v1/exchangeInfo?symbol=ETHUSDT',
   hyperliquidWsUrl: 'wss://api.hyperliquid.xyz/ws',
   hyperliquidInfoUrl: 'https://api.hyperliquid.xyz/info',
@@ -29,13 +31,29 @@ export const DEFAULT_PHASE1_ENDPOINTS: RecorderEndpointsConfig = {
   fxSpotUrl: 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=USDC_USDT',
 };
 
+export interface BinanceRestSnapshotPayload {
+  lastUpdateId: number | string;
+  E?: number;
+  T?: number;
+  bids: PriceLevel[];
+  asks: PriceLevel[];
+}
+
 export interface RecorderOptions {
   outputDir: string;
+  overwrite?: boolean;
   durationMs?: number;
   injectDisconnectAtMs?: number;
+  injectDelayedConn1SnapshotMs?: number;
   fundingPollIntervalMs?: number;
   endpoints?: Partial<RecorderEndpointsConfig>;
   includeCrossexBypass?: boolean;
+  maxBinanceBufferLength?: number;
+  binanceDepthSnapshotFetcher?: (
+    url: string,
+    connGen: number,
+    signal: AbortSignal,
+  ) => Promise<BinanceRestSnapshotPayload>;
   onEvent?: (event: RecordedMarketEvent) => void;
 }
 
@@ -55,8 +73,14 @@ async function fetchJsonWithTimeout<T>(
   url: string,
   init: RequestInit = {},
   timeoutMs = 10_000,
+  externalSignal?: AbortSignal,
 ): Promise<T> {
   const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort', onAbort, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
@@ -73,6 +97,7 @@ async function fetchJsonWithTimeout<T>(
     return await response.json() as T;
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -179,7 +204,7 @@ export async function fetchPhase1CatalogMeta(endpoints: RecorderEndpointsConfig)
  */
 export class Phase1MarketRecorder {
   private readonly endpoints: RecorderEndpointsConfig;
-  private readonly bnBook = new BinanceOrderBookStateMachine();
+  private readonly bnBook: BinanceOrderBookStateMachine;
   private readonly hlBook = new HyperliquidOrderBookStateMachine();
   private stream: WriteStream | null = null;
   private recvSeq = 0;
@@ -195,7 +220,8 @@ export class Phase1MarketRecorder {
   private hlSocket: WebSocket | null = null;
   private cxSocket: WebSocket | null = null;
 
-  private bnResyncInFlight = false;
+  private readonly bnInFlightConnGens = new Set<number>();
+  private readonly bnAbortControllers = new Map<number, AbortController>();
   private bnSnapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private bnReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private hlReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -205,12 +231,25 @@ export class Phase1MarketRecorder {
   private fundingPollTimer: ReturnType<typeof setInterval> | null = null;
 
   private seenSettlementKeys = new Set<string>();
+  private binanceFundingIntervalHours: number | null = null;
+  private lastHlOracle: { price: string; ts: number } | null = null;
+  private lastFx: { rate: string; ts: number; source: FxRateRecorded['source'] } | null = null;
+  private lastReportedOverflowCount = 0;
   private catalogMeta: CaptureCatalogMeta | null = null;
   private startedAtMs = 0;
   private startedAtIso = '';
 
   constructor(private readonly options: RecorderOptions) {
     this.endpoints = { ...DEFAULT_PHASE1_ENDPOINTS, ...options.endpoints };
+    this.bnBook = new BinanceOrderBookStateMachine(options.maxBinanceBufferLength);
+  }
+
+  getBinanceBookState() {
+    return this.bnBook.getDiagnostics();
+  }
+
+  getBinanceSnapshotRequestCountForGeneration(connGen: number): boolean {
+    return this.bnInFlightConnGens.has(connGen);
   }
 
   private emit(event: RecordedMarketEvent): void {
@@ -230,7 +269,12 @@ export class Phase1MarketRecorder {
     mkdirSync(this.options.outputDir, { recursive: true });
     const eventsPath = join(this.options.outputDir, 'events.ndjson');
     const manifestPath = join(this.options.outputDir, 'manifest.json');
-    this.stream = createWriteStream(eventsPath, { flags: 'w' });
+    if (!this.options.overwrite && existsSync(eventsPath)) {
+      throw new Error(
+        `Refusing to overwrite existing capture at ${eventsPath}; use a fresh --out directory or pass --overwrite`,
+      );
+    }
+    this.stream = createWriteStream(eventsPath, { flags: this.options.overwrite ? 'w' : 'wx' });
 
     this.startedAtMs = Date.now();
     this.startedAtIso = new Date(this.startedAtMs).toISOString();
@@ -325,6 +369,9 @@ export class Phase1MarketRecorder {
     if (this.hlPingTimer) clearInterval(this.hlPingTimer);
     if (this.cxPingTimer) clearInterval(this.cxPingTimer);
     if (this.fundingPollTimer) clearInterval(this.fundingPollTimer);
+    for (const controller of this.bnAbortControllers.values()) controller.abort();
+    this.bnAbortControllers.clear();
+    this.bnInFlightConnGens.clear();
     this.bnSocket?.close();
     this.hlSocket?.close();
     this.cxSocket?.close();
@@ -354,25 +401,17 @@ export class Phase1MarketRecorder {
   private connectBinance(): void {
     if (this.stopped) return;
     const connGen = ++this.bnConnGen;
+    for (const [gen, controller] of this.bnAbortControllers) {
+      if (gen < connGen && !(gen === 1 && (this.options.injectDelayedConn1SnapshotMs ?? 0) > 0)) {
+        controller.abort();
+      }
+    }
     const socket = new WebSocket(this.endpoints.binanceWsUrl);
     this.bnSocket = socket;
 
     socket.on('open', () => {
       if (this.stopped || connGen !== this.bnConnGen) return;
-      this.bnBook.onConnectionOpen(connGen);
-      this.emit({
-        type: 'conn_event',
-        venue: 'BINANCE',
-        connGen,
-        ...this.nextSeq(),
-        status: 'open',
-        url: this.endpoints.binanceWsUrl,
-      });
-      if (this.bnSnapshotTimer) clearTimeout(this.bnSnapshotTimer);
-      // Buffer ~250ms of deltas first so the REST snapshot bridges cleanly inside the buffer.
-      this.bnSnapshotTimer = setTimeout(() => {
-        void this.fetchAndBridgeBinanceSnapshot(connGen);
-      }, 250);
+      this.onBinanceConnectionOpened(connGen);
     });
 
     socket.on('message', (raw) => {
@@ -391,79 +430,7 @@ export class Phase1MarketRecorder {
           b?: PriceLevel[];
           a?: PriceLevel[];
         };
-        const d = (parsed.data ?? parsed) as Record<string, unknown>;
-        if (d.e !== 'depthUpdate') return;
-        const U = String(d.U);
-        const u = String(d.u);
-        const pu = String(d.pu);
-        const bids = (d.b ?? []) as PriceLevel[];
-        const asks = (d.a ?? []) as PriceLevel[];
-        const eventTime = Number(d.E ?? stamp.recvTs);
-        const transactionTime = d.T === undefined ? undefined : Number(d.T);
-
-        this.emit({
-          type: 'bn_depth_delta',
-          connGen,
-          ...stamp,
-          stream: parsed.stream ?? this.endpoints.binanceStreamName,
-          eventTime,
-          ...(transactionTime !== undefined ? { transactionTime } : {}),
-          U,
-          u,
-          pu,
-          bids,
-          asks,
-        });
-
-        const res = this.bnBook.onDepthDelta({
-          connGen,
-          recvSeq: stamp.recvSeq,
-          recvTs: stamp.recvTs,
-          eventTime,
-          ...(transactionTime !== undefined ? { transactionTime } : {}),
-          U,
-          u,
-          pu,
-          bids,
-          asks,
-        });
-        if (res.kind === 'bridge_ready') {
-          this.emit({ type: 'bn_book_state', connGen, ...this.nextSeq(), event: 'bridge_ready', detail: res.proof });
-        } else if (res.kind === 'bridge_failed_refetch') {
-          this.emit({
-            type: 'bn_book_state',
-            connGen,
-            ...this.nextSeq(),
-            event: 'bridge_failed_refetch',
-            detail: res,
-          });
-          this.scheduleBinanceResync(connGen, 200);
-        } else if (res.kind === 'sequence_gap') {
-          this.emit({
-            type: 'bn_book_state',
-            connGen,
-            ...this.nextSeq(),
-            event: 'sequence_gap',
-            detail: res,
-          });
-          this.bnBook.markGapResyncing();
-          this.emit({
-            type: 'bn_book_state',
-            connGen,
-            ...this.nextSeq(),
-            event: 'resync_started',
-            detail: { reason: 'sequence_gap' },
-          });
-          this.scheduleBinanceResync(connGen, 200);
-        } else if (res.kind === 'duplicate_ignored') {
-          this.emit({
-            type: 'bn_book_state',
-            connGen,
-            ...this.nextSeq(),
-            event: 'duplicate_ignored',
-            detail: res,
-          });
-        }
+        this.handleBinanceDepthPayload(connGen, parsed, stamp);
       } catch {
         // Ignore malformed frame safely.
       }
@@ -499,26 +466,182 @@ export class Phase1MarketRecorder {
     });
   }
 
+  onBinanceConnectionOpened(connGen: number, snapshotDelayMs = 250): void {
+    if (connGen > this.bnConnGen) this.bnConnGen = connGen;
+    this.bnBook.onConnectionOpen(connGen);
+    this.lastReportedOverflowCount = this.bnBook.getDiagnostics().droppedOverflowCount;
+    this.emit({
+      type: 'conn_event',
+      venue: 'BINANCE',
+      connGen,
+      ...this.nextSeq(),
+      status: 'open',
+      url: this.endpoints.binanceWsUrl,
+    });
+    this.scheduleBinanceResync(connGen, snapshotDelayMs);
+  }
+
+  handleBinanceDepthPayload(
+    connGen: number,
+    parsed: {
+      stream?: string;
+      data?: Record<string, unknown>;
+      e?: string;
+      E?: number;
+      T?: number;
+      U?: number | string;
+      u?: number | string;
+      pu?: number | string;
+      b?: PriceLevel[];
+      a?: PriceLevel[];
+    },
+    stampOverride?: { recvSeq: number; recvTs: number },
+  ): void {
+    const stamp = stampOverride ?? this.nextSeq();
+    const d = (parsed.data ?? parsed) as Record<string, unknown>;
+    if (d.e !== 'depthUpdate') return;
+    const U = String(d.U);
+    const u = String(d.u);
+    const pu = String(d.pu);
+    const bids = (d.b ?? []) as PriceLevel[];
+    const asks = (d.a ?? []) as PriceLevel[];
+    const eventTime = Number(d.E ?? stamp.recvTs);
+    const transactionTime = d.T === undefined ? undefined : Number(d.T);
+
+    this.emit({
+      type: 'bn_depth_delta',
+      connGen,
+      ...stamp,
+      stream: parsed.stream ?? this.endpoints.binanceStreamName,
+      eventTime,
+      ...(transactionTime !== undefined ? { transactionTime } : {}),
+      U,
+      u,
+      pu,
+      bids,
+      asks,
+    });
+
+    const res = this.bnBook.onDepthDelta({
+      connGen,
+      recvSeq: stamp.recvSeq,
+      recvTs: stamp.recvTs,
+      eventTime,
+      ...(transactionTime !== undefined ? { transactionTime } : {}),
+      U,
+      u,
+      pu,
+      bids,
+      asks,
+    });
+    const diag = this.bnBook.getDiagnostics();
+    if (diag.droppedOverflowCount > this.lastReportedOverflowCount) {
+      this.lastReportedOverflowCount = diag.droppedOverflowCount;
+      this.emit({
+        type: 'bn_book_state',
+        connGen,
+        ...this.nextSeq(),
+        event: 'buffer_overflow',
+        detail: diag,
+      });
+    }
+    if (res.kind === 'bridge_ready') {
+      this.emit({ type: 'bn_book_state', connGen, ...this.nextSeq(), event: 'bridge_ready', detail: res.proof });
+    } else if (res.kind === 'bridge_failed_refetch') {
+      this.emit({
+        type: 'bn_book_state',
+        connGen,
+        ...this.nextSeq(),
+        event: 'bridge_failed_refetch',
+        detail: res,
+      });
+      this.scheduleBinanceResync(connGen, 200);
+    } else if (res.kind === 'sequence_gap') {
+      this.emit({
+        type: 'bn_book_state',
+        connGen,
+        ...this.nextSeq(),
+        event: 'sequence_gap',
+        detail: res,
+      });
+      this.bnBook.markGapResyncing();
+      this.emit({
+        type: 'bn_book_state',
+        connGen,
+        ...this.nextSeq(),
+        event: 'resync_started',
+        detail: { reason: 'sequence_gap' },
+      });
+      this.scheduleBinanceResync(connGen, 200);
+    } else if (res.kind === 'duplicate_ignored') {
+      this.emit({
+        type: 'bn_book_state',
+        connGen,
+        ...this.nextSeq(),
+        event: 'duplicate_ignored',
+        detail: res,
+      });
+    }
+  }
+
   private scheduleBinanceResync(connGen: number, delayMs: number): void {
     if (this.stopped || connGen !== this.bnConnGen) return;
     if (this.bnSnapshotTimer) clearTimeout(this.bnSnapshotTimer);
+    if (delayMs <= 0) {
+      this.bnSnapshotTimer = null;
+      void this.fetchAndBridgeBinanceSnapshot(connGen);
+      return;
+    }
     this.bnSnapshotTimer = setTimeout(() => {
+      this.bnSnapshotTimer = null;
       void this.fetchAndBridgeBinanceSnapshot(connGen);
     }, delayMs);
   }
 
-  private async fetchAndBridgeBinanceSnapshot(connGen: number): Promise<void> {
-    if (this.stopped || connGen !== this.bnConnGen || this.bnResyncInFlight) return;
-    this.bnResyncInFlight = true;
+  async fetchAndBridgeBinanceSnapshot(connGen: number): Promise<void> {
+    if (this.stopped || connGen !== this.bnConnGen || this.bnInFlightConnGens.has(connGen)) return;
+    this.bnInFlightConnGens.add(connGen);
+    const controller = new AbortController();
+    this.bnAbortControllers.set(connGen, controller);
     try {
-      const snap = await fetchJsonWithTimeout<{
-        lastUpdateId: number | string;
-        E?: number;
-        T?: number;
-        bids: PriceLevel[];
-        asks: PriceLevel[];
-      }>(this.endpoints.binanceRestDepthUrl);
-      if (this.stopped || connGen !== this.bnConnGen) return;
+      const fetchSnap = this.options.binanceDepthSnapshotFetcher
+        ?? ((url: string, _gen: number, signal: AbortSignal) => fetchJsonWithTimeout<BinanceRestSnapshotPayload>(
+          url,
+          {},
+          10_000,
+          signal,
+        ));
+      const snap = await fetchSnap(this.endpoints.binanceRestDepthUrl, connGen, controller.signal);
+      if (connGen === 1 && (this.options.injectDelayedConn1SnapshotMs ?? 0) > 0 && !this.stopped) {
+        await new Promise<void>((resolve) => {
+          setTimeout(() => resolve(), this.options.injectDelayedConn1SnapshotMs);
+        });
+      }
+      if (this.stopped) return;
+      if (connGen !== this.bnConnGen) {
+        this.emit({
+          type: 'bn_book_state',
+          connGen,
+          ...this.nextSeq(),
+          event: 'stale_snapshot_ignored',
+          detail: {
+            staleConnGen: connGen,
+            activeConnGen: this.bnConnGen,
+            lastUpdateId: String(snap.lastUpdateId),
+            reason: 'connection_rotated',
+          },
+        });
+        // Ensure active generation is not left stranded without an active/scheduled snapshot.
+        if (
+          this.bnBook.getConnectionGeneration() === this.bnConnGen
+          && this.bnBook.getState() === 'BUFFERING'
+          && !this.bnInFlightConnGens.has(this.bnConnGen)
+          && !this.bnSnapshotTimer
+        ) {
+          this.scheduleBinanceResync(this.bnConnGen, 0);
+        }
+        return;
+      }
       const stamp = this.nextSeq();
       this.emit({
         type: 'bn_depth_snapshot',
@@ -548,7 +671,8 @@ export class Phase1MarketRecorder {
         this.scheduleBinanceResync(connGen, 1_000);
       }
     } finally {
-      this.bnResyncInFlight = false;
+      this.bnInFlightConnGens.delete(connGen);
+      this.bnAbortControllers.delete(connGen);
     }
   }
 
@@ -774,7 +898,12 @@ export class Phase1MarketRecorder {
 
   private async pollFundingAndFx(): Promise<void> {
     const startMs = Math.max(0, this.startedAtMs - 9 * 3600_000);
-    const [bnPred, bnSettled, hlMetaCtx, hlHist, fxRes] = await Promise.allSettled([
+    const [bnInfoRes, bnPred, bnSettled, hlMetaCtx, hlHist, fxRes] = await Promise.allSettled([
+      this.binanceFundingIntervalHours === null
+        ? fetchJsonWithTimeout<Array<{ symbol: string; fundingIntervalHours?: number }>>(
+            this.endpoints.binanceFundingInfoUrl,
+          )
+        : Promise.resolve(null),
       fetchJsonWithTimeout<{
         symbol: string;
         markPrice: string;
@@ -809,8 +938,38 @@ export class Phase1MarketRecorder {
       fetchJsonWithTimeout<Array<{ currency_pair: string; last: string }>>(this.endpoints.fxSpotUrl),
     ]);
 
+    if (bnInfoRes.status === 'fulfilled' && Array.isArray(bnInfoRes.value)) {
+      const ethInfo = bnInfoRes.value.find((item) => item.symbol === 'ETHUSDT');
+      if (typeof ethInfo?.fundingIntervalHours === 'number' && Number.isFinite(ethInfo.fundingIntervalHours)) {
+        this.binanceFundingIntervalHours = ethInfo.fundingIntervalHours;
+      }
+    }
+
+    if (fxRes.status === 'fulfilled' && fxRes.value[0]?.last) {
+      const fxStamp = this.nextSeq();
+      this.lastFx = { rate: fxRes.value[0].last, ts: fxStamp.recvTs, source: 'gate_spot_ticker' };
+      this.emit({
+        type: 'fx_rate',
+        ...fxStamp,
+        pair: 'USDC_USDT',
+        rate: fxRes.value[0].last,
+        source: 'gate_spot_ticker',
+      });
+    } else {
+      const fxStamp = this.nextSeq();
+      this.lastFx = { rate: '1', ts: fxStamp.recvTs, source: 'parity_fallback' };
+      this.emit({
+        type: 'fx_rate',
+        ...fxStamp,
+        pair: 'USDC_USDT',
+        rate: '1',
+        source: 'parity_fallback',
+      });
+    }
+
     if (bnPred.status === 'fulfilled') {
       const p = bnPred.value;
+      const hasNext = Number.isFinite(Number(p.nextFundingTime)) && Number(p.nextFundingTime) > 0;
       this.emit({
         type: 'funding_pred',
         venue: 'BINANCE',
@@ -818,8 +977,10 @@ export class Phase1MarketRecorder {
         source: 'bn_premium_index',
         symbol: 'ETHUSDT',
         fundingRate: p.lastFundingRate,
-        nextFundingTime: Number(p.nextFundingTime),
-        intervalHours: 8,
+        nextFundingTime: hasNext ? Number(p.nextFundingTime) : null,
+        nextFundingTimeSource: hasNext ? 'api_premium_index' : 'missing',
+        intervalHours: this.binanceFundingIntervalHours,
+        intervalSource: this.binanceFundingIntervalHours !== null ? 'api_funding_info' : 'missing',
         markPrice: p.markPrice,
         indexOrOraclePrice: p.indexPrice,
       });
@@ -829,17 +990,20 @@ export class Phase1MarketRecorder {
       const idx = hlMetaCtx.value[0].universe.findIndex((u) => u.name === 'ETH');
       const ctx = idx >= 0 ? hlMetaCtx.value[1][idx] : undefined;
       if (ctx) {
-        const now = Date.now();
-        const nextHour = Math.floor(now / 3_600_000 + 1) * 3_600_000;
+        const predStamp = this.nextSeq();
+        this.lastHlOracle = { price: ctx.oraclePx, ts: predStamp.recvTs };
+        const nextHour = Math.floor(predStamp.recvTs / 3_600_000 + 1) * 3_600_000;
         this.emit({
           type: 'funding_pred',
           venue: 'HYPERLIQUID',
-          ...this.nextSeq(),
+          ...predStamp,
           source: 'hl_meta_ctx',
           symbol: 'ETH',
           fundingRate: ctx.funding,
           nextFundingTime: nextHour,
+          nextFundingTimeSource: 'derived_utc_hour',
           intervalHours: 1,
+          intervalSource: 'protocol_hourly_spec',
           markPrice: ctx.markPx,
           indexOrOraclePrice: ctx.oraclePx,
         });
@@ -851,15 +1015,23 @@ export class Phase1MarketRecorder {
         const key = `BN:${row.fundingTime}`;
         if (this.seenSettlementKeys.has(key)) continue;
         this.seenSettlementKeys.add(key);
+        const settlementTime = Number(row.fundingTime);
         this.emit({
           type: 'funding_settled',
           venue: 'BINANCE',
           ...this.nextSeq(),
           source: 'bn_funding_rate_api',
           symbol: row.symbol,
-          settlementTime: Number(row.fundingTime),
+          settlementTime,
+          isHistoricalBackfill: settlementTime < this.startedAtMs,
           fundingRate: row.fundingRate,
-          referencePriceOrPremium: row.markPrice,
+          markPrice: row.markPrice || null,
+          premium: null,
+          nearestOraclePriceUsdc: null,
+          nearestOraclePriceTs: null,
+          nearestFxUsdcUsdt: null,
+          nearestFxTs: null,
+          nearestFxSource: null,
         });
       }
     }
@@ -869,35 +1041,25 @@ export class Phase1MarketRecorder {
         const key = `HL:${row.time}`;
         if (this.seenSettlementKeys.has(key)) continue;
         this.seenSettlementKeys.add(key);
+        const settlementTime = Number(row.time);
         this.emit({
           type: 'funding_settled',
           venue: 'HYPERLIQUID',
           ...this.nextSeq(),
           source: 'hl_funding_history_api',
           symbol: row.coin,
-          settlementTime: Number(row.time),
+          settlementTime,
+          isHistoricalBackfill: settlementTime < this.startedAtMs,
           fundingRate: row.fundingRate,
-          referencePriceOrPremium: row.premium,
+          markPrice: null,
+          premium: row.premium,
+          nearestOraclePriceUsdc: this.lastHlOracle?.price ?? null,
+          nearestOraclePriceTs: this.lastHlOracle?.ts ?? null,
+          nearestFxUsdcUsdt: this.lastFx?.rate ?? null,
+          nearestFxTs: this.lastFx?.ts ?? null,
+          nearestFxSource: this.lastFx?.source ?? null,
         });
       }
-    }
-
-    if (fxRes.status === 'fulfilled' && fxRes.value[0]?.last) {
-      this.emit({
-        type: 'fx_rate',
-        ...this.nextSeq(),
-        pair: 'USDC_USDT',
-        rate: fxRes.value[0].last,
-        source: 'gate_spot_ticker',
-      });
-    } else {
-      this.emit({
-        type: 'fx_rate',
-        ...this.nextSeq(),
-        pair: 'USDC_USDT',
-        rate: '1',
-        source: 'parity_fallback',
-      });
     }
   }
 }

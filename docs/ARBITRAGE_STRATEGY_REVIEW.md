@@ -240,3 +240,34 @@
 汇总时请额外列出未能估值的持仓和数量，避免所有未估值行被跳过后显示为零损益。模拟器假设两腿同步全量成交，报告中的裸腿时间 0 ms 仅描述该假设。费用表采用原生场所回退费率时，继续注明与账户实收费率的区别。
 
 **本轮验证。** 独立运行仓库 `vitest run apps/backend/src/phase1/phase1.test.ts`，5 项均通过。上表的边界输入及跨代次测试另行调用提交中的状态机、录盘器快照方法和回放入口完成，没有启动长录。请团队先回复采集修复提交和短录桥接证据，回放修复与逐笔报告随后提交。
+
+## 十、采集竞态修复与跨代次短录实证（2026-11-27）
+
+开发团队已完成第九节第 9.2 节阻塞项修复及资金费输入完整性增强，并已在新空白目录完成 15 秒实盘短录实证。
+
+### 1. 采集修复内容
+
+1. **按连接代次管理 Binance REST 快照请求与中止（[recorder.ts](../apps/backend/src/phase1/recorder.ts#L587)）**
+   - 将全局共享的 `bnResyncInFlight` 替换为按连接代次 `connGen` 隔离的 `bnInFlightConnGens` 集合与 `bnAbortControllers` 映射。
+   - 连接轮转时对旧代次发出 `AbortController.abort()`（同时保留显式测试延迟注入通道）；即使旧代次请求因底层阻塞而在新连接打开后才延迟返回，新代次 `connGen` 不会被吞掉，旧响应命中 `connGen !== bnConnGen` 时触发 `stale_snapshot_ignored` 记录，且在 `BUFFERING` 兜底检查中绝不遗漏新代次补拉。
+2. **有界缓冲与防覆盖保护（[orderbook-state.ts](../apps/backend/src/phase1/orderbook-state.ts#L117)、[recorder.ts](../apps/backend/src/phase1/recorder.ts#L267)）**
+   - `BinanceOrderBookStateMachine` 增加默认 `maxBufferLength = 5000` 上限与 `droppedOverflowCount` 计数，超限时触发 `buffer_overflow` 状态记录。
+   - `Phase1MarketRecorder.run()` 默认拒绝覆盖已有 `events.ndjson`（除非显式传入 `--overwrite`），确保长录必须使用新目录。
+3. **资金费预测周期与结算参考价来源明确化（[types.ts](../apps/backend/src/phase1/types.ts#L171)、[recorder.ts](../apps/backend/src/phase1/recorder.ts#L899)）**
+   - 接入 Binance `https://fapi.binance.com/fapi/v1/fundingInfo` 实测 `ETHUSDT` 的 `fundingIntervalHours = 8`，`funding_pred` 显式标明 `intervalSource`（`api_funding_info` / `protocol_hourly_spec` / `missing`）及 `nextFundingTimeSource`（`api_premium_index` / `derived_utc_hour` / `missing`）。
+   - `funding_settled` 显式区分 `isHistoricalBackfill`（启动前历史补录 vs 录制期实际结算），并分开保存 Binance `markPrice`、Hyperliquid `premium` 与同期 `nearestOraclePriceUsdc`（含时间）及 `nearestFxUsdcUsdt`（含时间与来源）。
+
+### 2. 单测与 15 秒跨连接延迟快照短录实证
+
+- **单测与工程校验**：[phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts) 扩充至 8 项测试（新增：旧代次 REST 阻塞跨越断流至 `connGen=2` 桥接完成且随后延迟返回触发 `stale_snapshot_ignored`、缓冲溢出有界计数、拒绝覆盖既有目录）；全仓库 `eslint`、`typecheck` 与全量 `vitest` 测试全部通过。
+- **空白目录 15 秒实盘短录（`.local-data/phase1/short-race-proof-01`，共 `1,193` 条事件，`validOverlapMs = 13205 ms / 15174 ms`）**：
+  - CLI 参数：`--duration-sec 15 --inject-disconnect-sec 1 --inject-delayed-conn1-snapshot-ms 3000 --funding-poll-sec 10`
+  - **`connGen=1` 打开与断流**：Binance `connGen=1` 于 `recvTs=1795760832437` 打开并触发延迟快照 #1；于 `1795760833448` 注入断流并在 `1795760833450` 关闭。
+  - **新代次独立重同步**：Hyperliquid `connGen=2` 于 `1795760834068` 打开并在 `1795760834123` 收到首个有效 20 档快照（`sourceTs=1795760833585`）；Binance `connGen=2` 于 `1795760834076` 打开、在 `connGen=1` 快照仍挂起期间于 `1795760834339` 独立拉取 REST 快照（`lastUpdateId="12254957123557"`），并于 `1795760834373` 完成 `bridge_ready`（`bidLevels=1013` / `askLevels=1005`，`bestBid="1735.05"` / `bestAsk="1735.06"`）。
+  - **延迟旧响应隔离验证**：`1,326 ms` 后的 `recvTs=1795760835699`，`connGen=1` 的延迟快照（`lastUpdateId="12254956976616"`）才返回，系统发出 `bn_book_state: stale_snapshot_ignored`，`connGen=2` 盘口保持完整可用。
+
+### 3. 后续计划
+
+- 开发团队将随即在新输出目录启动 9 小时连续后台长录（覆盖完整 8 小时 Binance 结算周期与多次 Hyperliquid 整点结算，并在中段注入 1 次双腿断流恢复）；
+- 长录期间并行完成 **第 9.3 节** 的四项离线回放与报告修正（源/接收时间双校验与 5s/10s/15s 三档命令行复算、严格到达因果与期末在途单列、每腿每次结算原币损益与汇兑损益分离、流式/有界内存长文件回放及近长录规模基准测试），长录结束后提交正式样本报告供复审。
+
