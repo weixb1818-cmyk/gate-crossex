@@ -179,3 +179,32 @@
 2. **同意 0 ms 和 100 ms 两个单程延迟情景。** 起点是策略使用本地已收到的数据作出决策的时刻，0 ms 使用当时最后一个可用盘口，100 ms 使用同一回放时间轴上截至模拟到达时已收到且有效的盘口。两腿独立取价，缺口内按不可成交处理，禁止用到达时刻之后的快照回填。100 ms 是敏感性参数；实际的 CrossEx 下单延迟与成交质量需由对应执行数据验证。
 
 首次交付请给出一条 Binance 快照桥接与断流恢复记录、一条 Hyperliquid 重连后的首个有效快照，以及同一机会在两个延迟情景下的逐腿计算或拒绝原因。本节确认的是实施口径；短时探测由开发团队执行，长录覆盖率及回放结果待样本提交后复核。
+
+## 八、第一期代码落地、20 秒试录样本与长录前待确认细节（2026-11-27）
+
+开发团队已完成第一期代码模块开发、单元测试以及一次 20 秒真实公开行情试录（含第 8 秒断流重连注入）和离线双版回放验证。
+
+### 1. 已落地代码与校验情况
+
+- **进程内去代理与状态机**：[proxy-free.ts](../apps/backend/src/phase1/proxy-free.ts)、[orderbook-state.ts](../apps/backend/src/phase1/orderbook-state.ts)（`BinanceOrderBookStateMachine` 严格执行缓冲 → REST `lastUpdateId` → `U <= lastUpdateId <= u` 桥接 → `pu === prev_u` 校验；`HyperliquidOrderBookStateMachine` 完整替换 `l2Book` 快照并拒绝倒退时间戳；`walkOrderBookDepth` 严禁外推 20 档之外的不可见深度）。
+- **脱离前端的多源录盘器**：[recorder.ts](../apps/backend/src/phase1/recorder.ts)、[record-cli.ts](../apps/backend/src/phase1/record-cli.ts)（CLI：`npm run phase1:record -w apps/backend -- ...`），默认连接 Binance 官方路由 `wss://fstream.binance.com/public/stream?streams=ethusdt@depth@100ms` + `/fapi/v1/depth?symbol=ETHUSDT&limit=1000` 与 Hyperliquid `wss://api.hyperliquid.xyz/ws` `l2Book`，旁路同步录制 CrossEx WS 原始帧（节流与截深前），并周期性采集预测资金费率、实际结算记录及 Gate 现货 `USDC_USDT` 汇率。
+- **离线双版回放与成绩单导出**：[replay.ts](../apps/backend/src/phase1/replay.ts)、[replay-cli.ts](../apps/backend/src/phase1/replay-cli.ts)（CLI：`npm run phase1:replay -w apps/backend -- ...`），在同一回放时间轴与成交模型下并行输出 `bbo_v1` vs `vwap_taker_v2` × `0 ms` / `100 ms`，严禁未来数据回填，并将未发生字段（`rest_queue_wait_ms`、`margin_used_actual_usd`）保持为 `null`。
+- **单元测试**：[phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts)（覆盖代理剥离、Binance 4 类边界、Hyperliquid 重连与深度上限、以及 `0 ms` vs `100 ms` 缺口失效与净收益精算）；工作区 `lint`、`typecheck` 与全量 `vitest` 测试全部通过。
+
+### 2. 对第七节采样时钟的澄清与 20 秒试录实测摘录
+
+- **对第六节 Hyperliquid 采样时差的澄清**：第六节探测中 CrossEx WS 收到 Hyperliquid `order_book_update` 的第 1 帧源时间戳为 `1795750548695`（本地建连接收时间为 `1795750561447`，网关缓存已滞后约 `12.7s`），第 2 帧源时间戳为 `1795750561119`，`12.4s` 指的是这两帧**交易所源时间戳之差**，而 `10.5s` 指的是脚本本地接收循环总时长（采用本地单调时钟窗口）。
+- **20 秒试录样本实测（第 8 秒触发注入断流并自动重连）**：
+  - 采集窗口 `2026-11-27T05:56:45.164Z` → `05:57:05.277Z`（`totalWindowMs = 20113 ms`，双腿有效盘口重合 `validOverlapMs = 18878 ms`），共落盘 `1,533` 条事件（含 `bn_depth_delta: 188`、`bn_depth_snapshot: 2`、`hl_l2book: 3`、`cx_raw: 1277`、`funding_settled: 39` 等）。
+  - **Binance 桥接恢复**：`connGen=1` 在 `lastUpdateId = 12254734885084` 完成首次桥接（丢弃 1 帧预快照增量，`bidLevels=1012 / askLevels=1003`）；注入断流重连后 `connGen=2` 在 `lastUpdateId = 12254735611573` 自动重新桥接（丢弃 2 帧，`bidLevels=1013 / askLevels=1004`），全程 `sequence_gap = 0`。
+  - **Hyperliquid 重连首帧**：`connGen=2` 重连后于 `recvTs = 1795759013920` 捕获首个有效 20 档快照（`sourceTs = 1795759013441`）；但在直连下 `20s` 内 `hl_l2book` 仅推 3 帧（最大间隔接近 `10s`），而旁路 `cx_raw` 显示 CrossEx 对同一 HL `1795759014991` 帧的中转接收时刻相差仅约 `9 ms`（说明 HL `l2Book` 自身在盘口或区块未变化时推送较稀疏）。
+  - **双版回放结果（试跑参数 `Q = 0.500 ETH`、`entryBps = 1`、`tpBps = 0`、`VIP0 fallback`）**：`bbo_v1`（`0ms`/`100ms`）各盲目触发 1 笔（`planned_notional_usdt = 870.1`、`fees_4leg_usd = 1.65442`、期末估值 `-1.61568 USDT`）；`vwap_taker_v2` 在 19 个候选时点全部以 `NET_EDGE_NOT_POSITIVE` 拒绝触发（0 亏损），证明了往返成本过滤与只记真实亏损的预期作用。
+
+### 3. 长时录盘（≥ 8 小时）前需审计团队最后确认的三项口径参数
+
+目前代码实现和试录结构已齐备；为避免跑完 8–24 小时完整结算周期样本后再因默认阈值产生返工，请在长录正式验收前确认以下 3 项参数：
+
+1. **Hyperliquid `l2Book` 最大有效报价陈旧时间阈值（`maxBookAgeMs`）**：试录实测直连 `hl_l2book` 推送间隔有时可达数秒至约 10 秒。目前回放默认设 `maxBookAgeMs = 15_000 ms`（超过 15 秒未见新快照即判过期不参与触发与估值）。请确认采用 `15_000 ms` 是否合适，或希望收紧到如 `5_000 ms` / `10_000 ms`（并由此同步定义“有效盘口重合时长”）。
+2. **首份长录成绩单的标准测试参数集**：试录默认采用 `Q_plan = 0.500 ETH`、`budget_usdt = 2000`、`assumedLeverage = 5`、`entryBps = 2`（以及试录 `1`）、`takeProfitBps = 0`、`scenarioExitDepthBufferBps = 1`、`cooldownBetweenRejectsMs = 1000`。请确认长录交付按该参数集输出（或指定额外需要多档对比的 `Q_plan` / `entryBps` 档位）。
+3. **长录跨结算与断流注入频次**：计划连续后台录制 **8.5–24 小时**（至少完整覆盖 1 次 Binance 8 小时整点结算与多次 Hyperliquid 1 小时整点结算），期间在录制中段人为注入至少 1 次断流恢复片段，连同可复现回放命令、成绩单导出文件和 1 笔手工复算拆解一并提交第一期正式验收。
+
