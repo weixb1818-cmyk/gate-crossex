@@ -121,3 +121,45 @@
 - **决策和成交可分开重放。** 两版使用相同的数据、延迟假设和成交模型。决策仅使用当时已收到的事件；模拟单按设定到达时刻可用的深度估算成交。逐腿给出数量、均价、费率、手续费和时间，附一次手工可复算的往返或期末估值。若期末盘口失效或深度不足，标明无法完整估值的数量。目标止盈价差只用于事前判断。
 - **观测值、假设值及缺失值能区分。** 回退 VIP 0 时记录具体合约、角色、费率数值及来源。只有取得账户实报时才填写 `margin_used_actual_usd`，并注明账户级数值的范围；模拟值填写估算栏。纯离线运行未发生的 REST 排队时长填空，模拟裸腿时长注明所用延迟模型。报告明确净收益 bps 的分母，并分别列出往返已实现损益与期末估值。
 - **首轮交付。** 请附实现提交、录盘起止时间、两腿有效盘口的重合时长、一次断流恢复片段，以及可复现的回放命令和摘要。生产订单类型验证单列后续执行阶段；本期以公开行情、只读数据和离线模拟完成验收。
+
+## 六、开发团队协议探测补充与数据采集源决策（2026-11-27）
+
+在正式修改录盘代码前，开发团队于本机显式清除代理直连，对 CrossEx 公开合约目录、CrossEx WS 公共频道以及 Binance / Hyperliquid 官方直连公开行情做了只读报文探测，发现以下需要同步给审计团队的关键事实与调整决定。
+
+### 1. 实测协议事实
+
+1. **合约目录与数量单位确认（`https://api.gateio.ws/api/v4/crossex/rule/symbols`）**
+   - `BINANCE_FUTURE_ETH_USDT`：`state = live`，`min_size = 0.001`，`lot_size = 0.001`，`tick_size = 0.01`，`min_notional = 20`，`max_market_size = 2000`，`max_limit_size = 10000`，`contract_size = null`。
+   - `HYPERLIQUID_FUTURE_ETH_USDC`：`state = live`，`min_size = 0.0001`，`lot_size = 0.0001`，`tick_size = 0.01`，`min_notional = 10`，`max_market_size = null`，`max_limit_size = null`，`contract_size = null`。
+   - 两腿均直接以 `ETH` 为数量单位（不额外乘 `contract_size`），共同可执行步长为 `0.001 ETH`，最小名义门槛取 `20 USD`。
+
+2. **CrossEx WS `order_book_update` 对两目标合约的实际限制**
+   - **`BINANCE_FUTURE_ETH_USDT`**（10.5 秒 / 104 帧采样）：`snapshots = 0`，首帧起即推送 `snapshot = false` 的局部增量，从未推送初始 `snapshot = true`；同时 CrossEx 转发时剥离了 Binance 原生用于校验零丢包的 `pu`（`previous_final_update_id`）字段，只保留 `U`/`u`（实测相邻帧 `U - prev_u` 为 `150 / 383 / 218 / 370` 等）。因此仅凭 CrossEx WS 既无法建立 Binance 初始盘口基线，也无法无误报地判定是否存在丢帧缺口；此外对无鉴权 `/crossex/order_book` 探测均返回 `MISSING_REQUIRED_HEADER: Timestamp`，WS `order_book` 频道返回 `Invalid channel`。
+   - **`HYPERLIQUID_FUTURE_ETH_USDC`**（10.5 秒 / 2 帧采样）：推送 `snapshot = true`（20 档，`U = u = ts`），但存在约 12 秒级缓存滞后与低频推送（首帧源时间戳滞后接收时间约 `12.7` 秒，两帧间隔约 `12.4` 秒；`funding_rate` 首帧滞后约 `23` 秒），而同连接 `ticker` 在 100ms 级别更新。
+   - （对照组 `GATE_FUTURE_ETH_USDT` 与 `OKX_FUTURE_ETH_USDT` 在 CrossEx WS 首帧即推 400 档 `snapshot = true`，增量分别严格满足 `U = prev_u + 1` 与 `U = prev_u`。）
+
+3. **交易所官方直连公开行情实测可用**
+   - **Binance Futures 直连**：`GET https://fapi.binance.com/fapi/v1/depth` 提供 `lastUpdateId` 快照；`wss://fstream.binance.com/ws/ethusdt@depth@100ms` 完整推送 `U`、`u` 与 `pu`（实测严格满足 `pu === prev_u`）。
+   - **Hyperliquid 直连**：`wss://api.hyperliquid.xyz/ws` 的 `l2Book` 推送 20 档全量深度快照，首帧实测传输滞后约 `571 ms`。
+   - **资金费与历史结算接口**：Binance（`premiumIndex` + `fundingRate`）与 Hyperliquid（`metaAndAssetCtxs` + `fundingHistory`）均直连可用。
+
+### 2. 开发团队决定（第一期采集与回放方案）
+
+1. **主盘口采集与重同步以“交易所官方直连（显式禁用代理）”为准**：
+   - Binance 腿通过 `REST /fapi/v1/depth` 快照 + `WS depth@100ms` 增量建立本地盘口，严格按 `lastUpdateId` / `U` / `u` / `pu` 校验连续性、快照前缓存、重复帧和断流重建；
+   - Hyperliquid 腿通过直连 `WS l2Book` 录制 20 档全量盘口，按时间戳与连接代次管理重连恢复；
+   - 所有采集与探测进程显式清除代理环境变量（直连 CEX/DEX），避免本机代理引入额外延迟。
+2. **保留 CrossEx WS 作为旁路对照记录**：
+   - 同步录制 CrossEx WS 的 `ticker`、`funding_rate` 与原始 `order_book_update` 帧，用于后续定量观测 CrossEx 网关中转延迟，但不作为第一期 Binance 深度建库或序号缺口判定的主数据源。
+3. **统一默认口径说明**：
+   - `roundtrip_net_bps` 分母统一定义为**单边计划开仓名义价值**（并同步在汇总表列出投入本金预算 `budget_usdt` 对应的收益率参考）；
+   - 离线回放同时输出 `0 ms`（信号到达即成交基准）与保守单程延迟假设（如 `100 ms`）结果，模拟裸腿时长明确标注所用延迟模型；
+   - Hyperliquid `USDC` 与 Binance `USDT` 之间的资金费/盈亏折算默认记录汇率来源与时间（缺省实时现货汇率时显式标注 `1:1` 平价假设）。
+
+### 3. 请求审计团队确认事项
+
+由于上述第 1、2 项调整将第一期盘口录制主源由“纯 CrossEx WS”变更为“**Binance / Hyperliquid 官方直连为主源 + CrossEx WS 旁路对照**”，请在进入首期编码与长时录盘前确认：
+
+1. **采集源变更确认**：是否同意按上述“官方直连为主盘口（保证 `lastUpdateId + U/u/pu` 序号与低延迟可验证）+ CrossEx WS 旁路记录对照”执行第一期录盘与双版离线回放验收？
+2. **口径默认值确认**：是否认可 `roundtrip_net_bps` 以单边计划名义价值为分母，以及离线延迟模型（`0 ms` 基准 + `100 ms` 敏感性对照）的交付形式？
+
