@@ -621,3 +621,27 @@ npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay 
 | 极小额真单 | 先交新窗口、账户费率重算及影子故障用例供复核，再由业务方决定是否试单。届时须明确账户与实拨资金、单对及每笔名义上限、杠杆上限、保证金缓冲、裸腿金额与最长时限、最大试验损失、触线后的撤单/减险动作及停机负责人。第 9.1 节的 2,000 USDT 与 5 倍仅为模拟参数。业务限额或授权未定，实盘测试配置中的实盘开仓额度设为零。 |
 
 **下次送审分两步。** 先回报新窗口起止、配置和费率快照进度。24 小时结束后提交双费率对照与逐笔产物，同时附二期影子验证结果及仍需业务决定的参数。若真实费率下机会消失，保留零成交或净亏结果，优先复核执行成本及 Maker 情景，再决定是否值得投入实盘试验。
+
+## 二十二、24 小时 ETH 样本外录盘启动登记与第 21 节首步汇报（2026-11-28）
+
+### 22.1 第 21.1–21.3 节代码就绪（提交 `59ffbf2`）
+
+已先行完成以下配套实现、测试并推送至 `origin/main`（全部后端 `17` 个测试文件 **`245/245` 通过**，含一期 `21/21`，`tsc --noEmit` 与 `eslint` 零报错）：
+
+1. **旧断点升级兼容护栏**（[replay.ts](../apps/backend/src/phase1/replay.ts)）：恢复 `ReplayCheckpoint` 时显式识别缺失平仓回退中间价的 `ddf3d81` 旧格式 `deferredTriggeredRows` 并抛出提示“请从原始 `events.ndjson` 重放”的明确错误；已在 [phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts) 补齐跨版本恢复测试。
+2. **脱敏账户费率快照与纯费率反事实对比**（[replay.ts](../apps/backend/src/phase1/replay.ts)、[replay-cli.ts](../apps/backend/src/phase1/replay-cli.ts)）：新增 `resolveFeeScheduleFromSnapshot`、`computeCounterfactualFeeImpactOnFixedTrades` 以及 CLI 参数 `--fee-snapshot <path>` 与 `--compare-fee-snapshot <path>`，按合同完整代码优先匹配 `specialFees` 并回退场所永续默认费率，同时保留原 `VIP0 fallback` 默认口径及标注溯源字段。
+3. **主档 UTC 逐时损益与持仓报表**（[replay.ts](../apps/backend/src/phase1/replay.ts)、[replay-cli.ts](../apps/backend/src/phase1/replay-cli.ts#L243-L257)）：`report.md` 第 3.1 节与 `scorecard.json` 自动输出主档（`15s / 2bps / vwap_taker_v2 / 100ms`）各 UTC 整点的开仓数、闭环数、期末留存持仓数及盈亏/费用/资金费拆解。
+
+### 22.2 24 小时 ETH 样本外录盘启动登记（第一阶段汇报）
+
+| 登记项 | 启动实测登记值 |
+|---|---|
+| 采集代码版本 | `59ffbf2cc5d632b1d7a28b8c01cea78a13de5127` |
+| 输出目录 | `/home/ubuntu/gatex/gate-crossex/.local-data/phase1/oos-24h-20261128` |
+| 标的白名单与场所 | `ETH` 固定对 · 主源：`BINANCE USDⓈ-M (ETHUSDT)` + `HYPERLIQUID (ETH)`；旁路：`CrossEx WS` |
+| 计划起止时间（UTC） | **启动**：`2026-11-28T09:25:29.797Z` → **计划结束（+86,400s）**：`2026-11-29T09:25:29.797Z` |
+| 启动状态核验 | `session_meta` 已剥离本地代理变量；HL 首帧 `20/20` 档应用（`1795857930353`）；BN 快照 `lastUpdateId="12265697580993"` 桥接 `SYNCED`（`1012/1003` 档，`1650.45 / 1650.46`）；注入断流定时：`+1,800s` |
+| 预计覆盖结算 | Binance 3 次 8 小时结算（`16:00Z`, `00:00Z`, `08:00Z`）+ Hyperliquid 24 次整点结算 |
+| 回放冻结参数 | `Q = 0.500 ETH`, `budget = 2000 USDT`, `leverage = 5x`, `entry_bps = 2,1`, `tp_bps = 0`, `exit_buffer = 1 bps`, `delays = 0,100 ms`, `hl_age = 15s,10s,5s`, `bn_age = 15s`；主档：`15s / 2bps / vwap_taker_v2 / 100ms` |
+| 账户费率快照进度 | **待核（pending）**：采集主机 `.env` 与本地凭证库暂无 CrossEx 只读 API 凭证（`credential_not_configured`）；已支持脱敏快照注入 `--fee-snapshot`，待账户负责人提供脱敏费率快照或只读凭证后即对本窗与原 9h 窗同步输出双费率对照 |
+| 二期并行边界 | **严格影子模式（实盘开仓额度设为 `0`）**：录盘期间仅并行开发与测试直连行情适配器校验及 CrossEx 模拟网关影子/故障用例，不产生任何真实委托 |
