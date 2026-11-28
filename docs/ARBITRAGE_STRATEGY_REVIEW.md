@@ -645,3 +645,21 @@ npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay 
 | 回放冻结参数 | `Q = 0.500 ETH`, `budget = 2000 USDT`, `leverage = 5x`, `entry_bps = 2,1`, `tp_bps = 0`, `exit_buffer = 1 bps`, `delays = 0,100 ms`, `hl_age = 15s,10s,5s`, `bn_age = 15s`；主档：`15s / 2bps / vwap_taker_v2 / 100ms` |
 | 账户费率快照进度 | **待核（pending）**：采集主机 `.env` 与本地凭证库暂无 CrossEx 只读 API 凭证（`credential_not_configured`）；已支持脱敏快照注入 `--fee-snapshot`，待账户负责人提供脱敏费率快照或只读凭证后即对本窗与原 9h 窗同步输出双费率对照 |
 | 二期并行边界 | **严格影子模式（实盘开仓额度设为 `0`）**：录盘期间仅并行开发与测试直连行情适配器校验及 CrossEx 模拟网关影子/故障用例，不产生任何真实委托 |
+
+## 二十三、二期影子架构与故障对账验证记录及 VIP0 账户费率状态说明（2026-11-28）
+
+按第 21.4 节并行开发要求，在不中断 24 小时 ETH 样本外录盘的前提下，已完成二期直连行情校验、CrossEx 订单语义构造、账户级共享保证金与故障模拟验证代码，所有实盘开仓额度严格锁定为 **`liveOpenNotionalCapUsd = '0'`**（零真实发单）：
+
+### 23.1 二期并行模块与验证回归摘要
+
+| 模块 | 覆盖范围 | 对应文件 |
+| --- | --- | --- |
+| **直连行情适配器 (`NativeDualMarketAdapter`)** | 校验合约目录状态（`BINANCE_FUTURE_ETH_USDT` / `HYPERLIQUID_FUTURE_ETH_USDC`）、WS 断连/缺口状态、双时间戳、可视深度、`FX` 新鲜度及同期 CrossEx `cx_raw` 可比报价偏离阈值；异常即冻结新增风险（同时保留实盘路径 [strategy-engine.ts](../apps/backend/src/strategy-engine.ts#L764) 原检验未动） | [native-market-adapter.ts](../apps/backend/src/phase2/native-market-adapter.ts) |
+| **CrossEx 订单语义与模拟网关 (`SimulatedCrossExGateway`)** | 构造并校验 `PROTECTIVE_LIMIT_IOC`、`MAKER_POC`、`MARKET_IOC`（显式标记无价差保护上限）与 `reduce_only` 载荷；记录 5 段生命周期时间戳（`decisionTs` → `queuedTs` → `dispatchedTs` → `ackedTs` → `firstFillTs`/`terminalFillTs`/`cancelRequestedTs`/`cancelConfirmedTs`）；注入零成交 IOC、部分成交 IOC 触发 `reduce_only` 减平、挂单 `POC` 撤单期间迟到成交去重，并与真实 [`TradingRuntime`](../apps/backend/src/trading-runtime.ts) 联调恢复 `AMBIGUOUS_SUBMIT_THEN_FILLED` 及 `quiesceOpenOrders` | [shadow-gateway.ts](../apps/backend/src/phase2/shadow-gateway.ts) · [shadow-runner.ts](../apps/backend/src/phase2/shadow-runner.ts) |
+| **共享保证金与独立资金费路径 (`SharedMarginCoordinator`)** | 多策略并发额度竞争与部分成交释放、强锁 `liveOpenNotionalCapUsd = '0'` 拦截实盘下单、裸腿金额/时长/试错亏损/维持保证金四项护栏联动撤单减平、重启后挂单与仓位一致性门控，以及基于点时可见 `funding_pred` 与实付 `funding_settled` 对账的资金费路径评估 | [shared-margin-coordinator.ts](../apps/backend/src/phase2/shared-margin-coordinator.ts) · [shadow-runner.ts](../apps/backend/src/phase2/shadow-runner.ts) |
+| **工程校验结论** | `tsc --noEmit` 零报错、`eslint apps/backend/src/phase2/*.ts` 零告警、`npm run build -w apps/backend` 成功、全量 Vitest **`18` 个测试文件 `256/256` 通过**（含 [phase2.test.ts](../apps/backend/src/phase2/phase2.test.ts) `11/11` 与 [phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts) `21/21`） | [phase2.test.ts](../apps/backend/src/phase2/phase2.test.ts) |
+
+### 23.2 账户 VIP0 状态与费率待核口径确认
+
+* **现状说明**：业务方确认当前 CrossEx 正式账号尚未开启交易、无任何 VIP 等级（普通 VIP 0 账号）。依据 CrossEx 官方计费规则及第 21.2 节要求，普通 VIP 0 账号在不同接入场所的实际费率（含场所基础费率与 `specialFees` 配置）仍以开户激活后经 `/api/v4/crossex/fee`（`queryFeeRates`）查询所得实时合同费率为准，不能直接等同于回放默认使用的原生场所 VIP 0 回退假设（Binance `0.0005` / Hyperliquid `0.00045`）。
+* **后续衔接**：24h 样本外录盘继续后台运行（`PID 3108038`，当前已写入 60,417+ 行）；待账号启用并取得只读凭证/脱敏费率快照后，即利用已就绪的 `--fee-snapshot` / `--compare-fee-snapshot` 能力，在同一窗口上输出 VIP 0 回退假设与 CrossEx 实测 VIP 0 账户费率的双口径对照，并在必要时同步补充 Maker+IOC 影子对比场景。
