@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 import {
   BinanceOrderBookStateMachine,
   HyperliquidOrderBookStateMachine,
+  SortedBookSide,
+  canonicalPriceKey,
   walkOrderBookDepth,
 } from './orderbook-state.js';
 import { stripProcessProxyEnv } from './proxy-free.js';
@@ -944,5 +946,489 @@ describe('Phase 1 Section 9.3 streaming, age-tier, causal, and FX isolation audi
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Phase 1 Section 14.2 audit regressions', () => {
+  for (const disconnectStatus of ['close', 'injected_disconnect'] as const) {
+    it(`invalidates HL book on ${disconnectStatus}, bounds overlap to 20ms, rejects in-flight fill at +100ms, and marks open position unvalued`, () => {
+      const events: RecordedMarketEvent[] = [
+        { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+        { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+        { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+        {
+          type: 'bn_depth_delta',
+          connGen: 1,
+          recvSeq: 4,
+          recvTs: 1000,
+          stream: 'ethusdt@depth@100ms',
+          eventTime: 1000,
+          U: '100',
+          u: '100',
+          pu: '99',
+          bids: [['99.9', '5']],
+          asks: [['100.0', '5']],
+        },
+        {
+          type: 'bn_depth_snapshot',
+          connGen: 1,
+          recvSeq: 5,
+          recvTs: 1000,
+          lastUpdateId: '100',
+          bids: [['99.9', '5']],
+          asks: [['100.0', '5']],
+        },
+        // HL gives profitable quote at t=1030, then disconnects at t=1050 (silent until stream end t=1300).
+        {
+          type: 'hl_l2book',
+          connGen: 1,
+          recvSeq: 6,
+          recvTs: 1030,
+          sourceTs: 1025,
+          coin: 'ETH',
+          bidLevels: 1,
+          askLevels: 1,
+          bids: [['101.0', '5']],
+          asks: [['101.1', '5']],
+        },
+        {
+          type: 'conn_event',
+          venue: 'HYPERLIQUID',
+          connGen: 1,
+          recvSeq: 7,
+          recvTs: 1050,
+          status: disconnectStatus,
+          url: 'hl',
+        },
+        // Stale post-disconnect snapshot from disconnected connGen=1 must be ignored.
+        {
+          type: 'hl_l2book',
+          connGen: 1,
+          recvSeq: 8,
+          recvTs: 1100,
+          sourceTs: 1095,
+          coin: 'ETH',
+          bidLevels: 1,
+          askLevels: 1,
+          bids: [['101.5', '5']],
+          asks: [['101.6', '5']],
+        },
+        // Binance stays alive & valid through t=1300.
+        {
+          type: 'bn_depth_delta',
+          connGen: 1,
+          recvSeq: 9,
+          recvTs: 1300,
+          stream: 'ethusdt@depth@100ms',
+          eventTime: 1300,
+          U: '101',
+          u: '101',
+          pu: '100',
+          bids: [['99.9', '5']],
+          asks: [['100.0', '5']],
+        },
+      ];
+
+      const result = runPhase1Replay(events, {
+        plannedQtyEth: '0.500',
+        entryBpsList: ['2'],
+        hlMaxAgeMsList: [15_000],
+        delaysMs: [0, 100],
+        cooldownBetweenRejectsMs: 0,
+      });
+
+      const cov = result.timelineDiagnostics.coverageByAgeTier[0]!;
+      expect(cov.hl_valid_ms).toBe(20);
+      expect(cov.valid_overlap_ms).toBe(20);
+
+      // 100ms pending order triggered at t=1030 matures at t=1130 -> MUST be rejected (HL disconnected at 1050).
+      const vwap100 = result.summaries.find((s) => s.strategy_version === 'vwap_taker_v2' && s.delay_ms === 100)!;
+      const bbo100 = result.summaries.find((s) => s.strategy_version === 'bbo_v1' && s.delay_ms === 100)!;
+      expect(vwap100.triggered_count).toBe(0);
+      expect(bbo100.triggered_count).toBe(0);
+      expect(vwap100.raw_reject_reasons.EXEC_INVALID_HL_BOOK_NOT_SYNCED).toBe(1);
+      expect(bbo100.raw_reject_reasons.EXEC_INVALID_HL_BOOK_NOT_SYNCED).toBe(1);
+
+      // 0ms triggered cleanly at t=1030 before disconnect; at end (t=1300) HL is still disconnected -> MUST be unvalued.
+      const vwap0 = result.summaries.find((s) => s.strategy_version === 'vwap_taker_v2' && s.delay_ms === 0)!;
+      expect(vwap0.triggered_count).toBe(1);
+      expect(vwap0.open_at_end_count).toBe(1);
+      expect(vwap0.unvalued_open_count).toBe(1);
+      expect(vwap0.unvalued_open_qty_eth).toBe('0.5');
+      expect(
+        result.unvaluedOpenPositions.find((p) => p.strategy_version === 'vwap_taker_v2' && p.delay_ms === 0)?.reason,
+      ).toBe('FINAL_BOOK_INVALID_HL_BOOK_NOT_SYNCED');
+    });
+  }
+
+  it('isolates stale-generation disconnects/opens and blocks reconnect fills until first new-gen snapshot', () => {
+    const events: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['99.9', '5']],
+        asks: [['100.0', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['99.9', '5']],
+        asks: [['100.0', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1030,
+        sourceTs: 1025,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['101.0', '5']],
+        asks: [['101.1', '5']],
+      },
+      // HL disconnects at 1050 and re-opens connGen=2 at 1100 (NO snapshot yet at 1130!).
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 7, recvTs: 1050, status: 'close', url: 'hl' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 2, recvSeq: 8, recvTs: 1100, status: 'open', url: 'hl' },
+      // Stale connGen=1 snapshot arrives at 1120 -> MUST NOT satisfy connGen=2.
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 9,
+        recvTs: 1120,
+        sourceTs: 1115,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['101.2', '5']],
+        asks: [['101.3', '5']],
+      },
+      // At t=1200 connGen=2 receives its first valid snapshot -> valid from 1200 onward.
+      {
+        type: 'hl_l2book',
+        connGen: 2,
+        recvSeq: 10,
+        recvTs: 1200,
+        sourceTs: 1195,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['99.9', '5']],
+        asks: [['100.0', '5']],
+      },
+      // Delayed stale connGen=1 close arriving AFTER connGen=2 opened/synced MUST NOT invalidate connGen=2!
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 11, recvTs: 1250, status: 'close', url: 'hl' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 12, recvTs: 1255, status: 'open', url: 'bn' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 13,
+        recvTs: 1300,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1300,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [['100.0', '5'], ['99.9', '0']],
+        asks: [['100.1', '5'], ['100.0', '0']],
+      },
+    ];
+
+    const result = runPhase1Replay(events, {
+      plannedQtyEth: '0.500',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      delaysMs: [0, 100],
+      cooldownBetweenRejectsMs: 0,
+    });
+
+    const cov = result.timelineDiagnostics.coverageByAgeTier[0]!;
+    // [1030, 1050] = 20ms + [1200, 1300] = 100ms -> 120ms (unaffected by stale gen=1 close at 1250!)
+    expect(cov.hl_valid_ms).toBe(120);
+    expect(cov.valid_overlap_ms).toBe(120);
+
+    // 100ms pending order from 1030 maturing at 1130 (between connGen=2 open at 1100 and snapshot at 1200) -> rejected!
+    const vwap100 = result.summaries.find((s) => s.strategy_version === 'vwap_taker_v2' && s.delay_ms === 100)!;
+    expect(vwap100.triggered_count).toBe(0);
+    expect(vwap100.raw_reject_reasons.EXEC_INVALID_HL_BOOK_NOT_SYNCED).toBe(1);
+
+    // 0ms opened at 1030, waited through disconnect, closed cleanly on connGen=2 at 1200!
+    const vwap0 = result.summaries.find((s) => s.strategy_version === 'vwap_taker_v2' && s.delay_ms === 0)!;
+    expect(vwap0.completed_roundtrips).toBe(1);
+    expect(vwap0.open_at_end_count).toBe(0);
+  });
+
+  it('reconciles late-arriving funding settlements identically to early settlements without changing decisions or double-counting', async () => {
+    const buildEvents = (fundingRecvTs: number, includeDuplicate: boolean): RecordedMarketEvent[] => {
+      const list: RecordedMarketEvent[] = [
+        { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+        { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+        { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+        {
+          type: 'bn_depth_delta',
+          connGen: 1,
+          recvSeq: 4,
+          recvTs: 1000,
+          stream: 'ethusdt@depth@100ms',
+          eventTime: 1000,
+          U: '100',
+          u: '100',
+          pu: '99',
+          bids: [['99.9', '5']],
+          asks: [['100.0', '5']],
+        },
+        {
+          type: 'bn_depth_snapshot',
+          connGen: 1,
+          recvSeq: 5,
+          recvTs: 1000,
+          lastUpdateId: '100',
+          bids: [['99.9', '5']],
+          asks: [['100.0', '5']],
+        },
+        // Entry at t=1030: Long BN @ 100.0, Short HL @ 101.0 (1 ETH -> spread +1.00 USDT).
+        {
+          type: 'hl_l2book',
+          connGen: 1,
+          recvSeq: 6,
+          recvTs: 1030,
+          sourceTs: 1025,
+          coin: 'ETH',
+          bidLevels: 1,
+          askLevels: 1,
+          bids: [['101.0', '5']],
+          asks: [['101.1', '5']],
+        },
+        // Exit convergence at t=1150: Short BN close @ 100.0, Long HL close @ 100.0 (spread 0).
+        {
+          type: 'bn_depth_delta',
+          connGen: 1,
+          recvSeq: 7,
+          recvTs: 1140,
+          stream: 'ethusdt@depth@100ms',
+          eventTime: 1138,
+          U: '101',
+          u: '101',
+          pu: '100',
+          bids: [['100.0', '5'], ['99.9', '0']],
+          asks: [['100.1', '5'], ['100.0', '0']],
+        },
+        {
+          type: 'hl_l2book',
+          connGen: 1,
+          recvSeq: 8,
+          recvTs: 1150,
+          sourceTs: 1148,
+          coin: 'ETH',
+          bidLevels: 1,
+          askLevels: 1,
+          bids: [['99.9', '5']],
+          asks: [['100.0', '5']],
+        },
+        {
+          type: 'funding_settled',
+          venue: 'BINANCE',
+          recvSeq: 9,
+          recvTs: fundingRecvTs,
+          source: 'bn_funding_rate_api',
+          symbol: 'ETHUSDT',
+          settlementTime: 1050,
+          isHistoricalBackfill: false,
+          fundingRate: '0.001',
+          markPrice: '100',
+          premium: null,
+          nearestOraclePriceUsdc: null,
+          nearestOraclePriceTs: null,
+          nearestFxUsdcUsdt: null,
+          nearestFxTs: null,
+          nearestFxSource: null,
+        },
+      ];
+      if (includeDuplicate) {
+        list.push({
+          type: 'funding_settled',
+          venue: 'BINANCE',
+          recvSeq: 10,
+          recvTs: fundingRecvTs + 10,
+          source: 'bn_funding_rate_api',
+          symbol: 'ETHUSDT',
+          settlementTime: 1050,
+          isHistoricalBackfill: false,
+          fundingRate: '0.001',
+          markPrice: '100',
+          premium: null,
+          nearestOraclePriceUsdc: null,
+          nearestOraclePriceTs: null,
+          nearestFxUsdcUsdt: null,
+          nearestFxTs: null,
+          nearestFxSource: null,
+        });
+      }
+      return list;
+    };
+
+    const replayCfg = {
+      plannedQtyEth: '1',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      delaysMs: [0],
+      cooldownBetweenRejectsMs: 0,
+    };
+
+    const earlyEvents = buildEvents(1080, false);
+    const lateEvents = buildEvents(1220, true);
+    const earlyRes = runPhase1Replay(earlyEvents, replayCfg);
+    const lateRes = runPhase1Replay(lateEvents, replayCfg);
+
+    const normalize = (rows: typeof earlyRes.rows) => rows.map((r) => ({ ...r, run_id: 'norm' }));
+    expect(lateRes.summaries).toEqual(earlyRes.summaries);
+    expect(normalize(lateRes.rows)).toEqual(normalize(earlyRes.rows));
+
+    const vwapEarly = earlyRes.rows.find((r) => r.strategy_version === 'vwap_taker_v2' && r.decision === 'TRIGGERED')!;
+    const vwapLate = lateRes.rows.find((r) => r.strategy_version === 'vwap_taker_v2' && r.decision === 'TRIGGERED')!;
+    expect(vwapEarly.funding_events_crossed).toBe(1);
+    expect(vwapEarly.funding_net_usd).toBe('-0.1');
+    expect(vwapLate.funding_events_crossed).toBe(1);
+    expect(vwapLate.funding_net_usd).toBe('-0.1');
+    expect(vwapLate.funding_legs).toEqual(vwapEarly.funding_legs);
+    expect(vwapLate.roundtrip_net_pnl_usd).toBe(vwapEarly.roundtrip_net_pnl_usd);
+
+    // Also verify streaming NDJSON runner produces identical streamed rows & summaries when funding arrives late.
+    const tmpDir = mkdtempSync(join(tmpdir(), 'phase1-late-funding-'));
+    try {
+      const sortedLate = [...lateEvents].sort((a, b) => a.recvTs - b.recvTs || a.recvSeq - b.recvSeq);
+      const ndjsonPath = join(tmpDir, 'events.ndjson');
+      writeFileSync(ndjsonPath, `${sortedLate.map((e) => JSON.stringify(e)).join('\n')}\n`);
+      const streamedRows: typeof earlyRes.rows = [];
+      const streamedRes = await runPhase1ReplayStream(ndjsonPath, replayCfg, {
+        retainRowsInMemory: true,
+        onFinalizedRow: (row) => streamedRows.push(row),
+      });
+      expect(streamedRes.summaries).toEqual(earlyRes.summaries);
+      expect(normalize(streamedRows)).toEqual(normalize(earlyRes.rows));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('collapses same-price levels across decimal formats without inflating depth and removes them cleanly', () => {
+    expect(canonicalPriceKey('100.00')).toBe('100');
+    expect(canonicalPriceKey('100.0')).toBe('100');
+    expect(canonicalPriceKey('00100.500')).toBe('100.5');
+
+    const side = new SortedBookSide(false);
+    side.loadSnapshot([['100.00', '0.3']]);
+    side.apply([['100.0', '0.4']]);
+
+    expect(side.size()).toBe(1);
+    expect(side.best()).toEqual(['100.0', '0.4']);
+    expect(side.getCrossFormatMutationCount()).toBe(1);
+    expect(side.walkDepth('0.5')).toEqual({
+      fillable: false,
+      requestedQty: '0.5',
+      maxAvailableQty: '0.4',
+      visibleLevels: 1,
+    });
+    expect(side.walkDepth('0.4')).toMatchObject({
+      fillable: true,
+      qty: '0.4',
+      vwapPrice: '100',
+      levelsUsed: 1,
+    });
+
+    // Zeroing with another notation must delete the original level.
+    side.apply([['100.000', '0']]);
+    expect(side.size()).toBe(0);
+    expect(side.best()).toBeNull();
+    expect(side.getCrossFormatMutationCount()).toBe(2);
+
+    // Direct removal of snapshot "100.00" using "100.0" x 0 must also delete cleanly.
+    const directRemovalSide = new SortedBookSide(false);
+    directRemovalSide.loadSnapshot([['100.00', '0.3']]);
+    directRemovalSide.apply([['100.0', '0']]);
+    expect(directRemovalSide.size()).toBe(0);
+    expect(directRemovalSide.best()).toBeNull();
+    expect(directRemovalSide.getCrossFormatMutationCount()).toBe(1);
+
+    // End-to-end replay must likewise reject 0.5 ETH when 100.00 x 0.3 is replaced by 100.0 x 0.4.
+    const events: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['99.50', '5']],
+        asks: [['100.00', '0.3']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['99.50', '5']],
+        asks: [['100.00', '0.3']],
+      },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1010,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1010,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [],
+        asks: [['100.0', '0.4']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 7,
+        recvTs: 1020,
+        sourceTs: 1015,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['101.0', '5']],
+        asks: [['101.2', '5']],
+      },
+    ];
+
+    const res = runPhase1Replay(events, {
+      plannedQtyEth: '0.500',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      delaysMs: [0],
+      cooldownBetweenRejectsMs: 0,
+    });
+    const vwap = res.summaries.find((s) => s.strategy_version === 'vwap_taker_v2')!;
+    expect(vwap.triggered_count).toBe(0);
+    expect(vwap.raw_reject_reasons.INSUFFICIENT_DEPTH_BINANCE).toBe(1);
+    expect(res.timelineDiagnostics.crossFormatPriceUpdates.binance).toBe(1);
   });
 });

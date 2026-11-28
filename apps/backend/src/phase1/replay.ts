@@ -292,6 +292,11 @@ export interface ReplaySuiteResult {
     binanceChannelsUsed: string[];
     liveSettledFundingCount: number;
     historicalBackfillFundingCount: number;
+    crossFormatPriceUpdates: {
+      binance: number;
+      hyperliquid: number;
+      total: number;
+    };
     coverageByAgeTier: AgeTierCoverageReport[];
   };
   summaries: VariantSummary[];
@@ -361,6 +366,12 @@ export interface StreamingReplayOptions {
   retainRowsInMemory?: boolean;
   maxRetainedRows?: number;
   onFinalizedRow?: (row: TradeScorecardRow) => void;
+  /**
+   * Optional pre-extracted settlement records used strictly for post-trade funding
+   * accounting so late-arriving settlements match their crossed holding intervals
+   * without affecting causal live trading decisions.
+   */
+  preloadedFundingSettlements?: readonly FundingSettledRecorded[];
 }
 
 export interface VariantCheckpoint {
@@ -403,6 +414,8 @@ export interface ReplayCheckpoint {
   hlBook: HyperliquidBookCheckpoint;
   lastFx: { ts: number; rate: string; source: FxRateRecorded['source'] };
   liveSettledFunding: FundingSettledRecorded[];
+  accountingLiveSettlements?: FundingSettledRecorded[];
+  hasPreloadedAccountingIndex?: boolean;
   historicalBackfillCount: number;
   seenSettlementKeys: string[];
   binanceBridges: BinanceBridgeProof[];
@@ -970,6 +983,48 @@ function midpointFromView(view: OrderBookView | null): string | null {
   return new Decimal(view.bestBid[0]).plus(view.bestAsk[0]).div(2).toString();
 }
 
+export function extractFundingSettlementsFromEvents(
+  events: readonly RecordedMarketEvent[],
+): FundingSettledRecorded[] {
+  return events.filter((ev): ev is FundingSettledRecorded => ev.type === 'funding_settled');
+}
+
+export async function extractFundingSettlementsFromFile(
+  ndjsonPath: string,
+): Promise<FundingSettledRecorded[]> {
+  const collected: FundingSettledRecorded[] = [];
+  const rl = createInterface({
+    input: createReadStream(ndjsonPath, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of rl) {
+    if (!line.includes('"funding_settled"')) continue;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parsed = JSON.parse(trimmed) as RecordedMarketEvent;
+    if (parsed.type === 'funding_settled') {
+      collected.push(parsed);
+    }
+  }
+  return collected;
+}
+
+function dedupeAndSortLiveSettlements(
+  records: readonly FundingSettledRecorded[],
+): FundingSettledRecorded[] {
+  const byKey = new Map<string, FundingSettledRecorded>();
+  for (const r of records) {
+    const key = `${r.venue}:${r.settlementTime}`;
+    const existing = byKey.get(key);
+    if (!existing || (existing.isHistoricalBackfill && !r.isHistoricalBackfill)) {
+      byKey.set(key, r);
+    }
+  }
+  return [...byKey.values()]
+    .filter((r) => !r.isHistoricalBackfill)
+    .sort((a, b) => a.settlementTime - b.settlementTime || a.venue.localeCompare(b.venue));
+}
+
 /**
  * Streaming single-pass offline replay engine supporting O(1) memory footprint over multi-GB
  * NDJSON captures, causal pending-order arrival, native-currency contract PnL separation,
@@ -992,6 +1047,8 @@ export class StreamingReplayRunner {
     source: 'parity_fallback',
   };
   private liveSettledFunding: FundingSettledRecorded[] = [];
+  private readonly accountingLiveSettlements: FundingSettledRecorded[];
+  private readonly hasPreloadedAccountingIndex: boolean;
   private historicalBackfillCount = 0;
   private seenSettlementKeys = new Set<string>();
 
@@ -1025,6 +1082,13 @@ export class StreamingReplayRunner {
       this.hlMachine.restoreCheckpoint(checkpoint.hlBook);
       this.lastFx = { ...checkpoint.lastFx };
       this.liveSettledFunding = checkpoint.liveSettledFunding.map((s) => ({ ...s }));
+      if (options.preloadedFundingSettlements !== undefined) {
+        this.hasPreloadedAccountingIndex = true;
+        this.accountingLiveSettlements = dedupeAndSortLiveSettlements(options.preloadedFundingSettlements);
+      } else {
+        this.hasPreloadedAccountingIndex = checkpoint.hasPreloadedAccountingIndex ?? false;
+        this.accountingLiveSettlements = (checkpoint.accountingLiveSettlements ?? []).map((s) => ({ ...s }));
+      }
       this.historicalBackfillCount = checkpoint.historicalBackfillCount;
       this.seenSettlementKeys = new Set(checkpoint.seenSettlementKeys);
       this.binanceBridges = [...checkpoint.binanceBridges];
@@ -1046,6 +1110,10 @@ export class StreamingReplayRunner {
       return;
     }
 
+    this.hasPreloadedAccountingIndex = options.preloadedFundingSettlements !== undefined;
+    this.accountingLiveSettlements = options.preloadedFundingSettlements
+      ? dedupeAndSortLiveSettlements(options.preloadedFundingSettlements)
+      : [];
     this.config = {
       ...DEFAULT_REPLAY_CONFIG,
       ...partialConfig,
@@ -1114,6 +1182,8 @@ export class StreamingReplayRunner {
       hlBook: this.hlMachine.exportCheckpoint(),
       lastFx: { ...this.lastFx },
       liveSettledFunding: this.liveSettledFunding.map((s) => ({ ...s })),
+      accountingLiveSettlements: this.accountingLiveSettlements.map((s) => ({ ...s })),
+      hasPreloadedAccountingIndex: this.hasPreloadedAccountingIndex,
       historicalBackfillCount: this.historicalBackfillCount,
       seenSettlementKeys: [...this.seenSettlementKeys],
       binanceBridges: [...this.binanceBridges],
@@ -1164,19 +1234,34 @@ export class StreamingReplayRunner {
           this.historicalBackfillCount += 1;
         } else {
           this.liveSettledFunding.push(ev);
+          this.liveSettledFunding.sort((a, b) => a.settlementTime - b.settlementTime || a.venue.localeCompare(b.venue));
         }
       }
     } else if (ev.type === 'conn_event') {
       if (ev.venue === 'BINANCE') {
-        updatedVenue = 'BINANCE';
-        if (ev.status === 'open') this.bnMachine.onConnectionOpen(ev.connGen);
-        else if (ev.status === 'close' || ev.status === 'injected_disconnect') this.bnMachine.markGapResyncing();
+        if (ev.status === 'open') {
+          if (this.bnMachine.onConnectionOpen(ev.connGen)) {
+            this.bnInGapRecovery = false;
+            updatedVenue = 'BINANCE';
+          }
+        } else if (ev.status === 'close' || ev.status === 'injected_disconnect') {
+          if (this.bnMachine.onConnectionDisconnect(ev.connGen)) {
+            this.bnInGapRecovery = false;
+            updatedVenue = 'BINANCE';
+          }
+        }
       } else if (ev.venue === 'HYPERLIQUID') {
-        updatedVenue = 'HYPERLIQUID';
-        if (ev.status === 'open') this.hlMachine.onConnectionOpen(ev.connGen);
+        if (ev.status === 'open') {
+          if (this.hlMachine.onConnectionOpen(ev.connGen)) {
+            updatedVenue = 'HYPERLIQUID';
+          }
+        } else if (ev.status === 'close' || ev.status === 'injected_disconnect') {
+          if (this.hlMachine.onConnectionDisconnect(ev.connGen)) {
+            updatedVenue = 'HYPERLIQUID';
+          }
+        }
       }
     } else if (ev.type === 'bn_depth_snapshot') {
-      updatedVenue = 'BINANCE';
       const res = this.bnMachine.onRestSnapshot({
         connGen: ev.connGen,
         fetchedAtMs: ev.recvTs,
@@ -1184,12 +1269,14 @@ export class StreamingReplayRunner {
         bids: ev.bids,
         asks: ev.asks,
       });
+      if (res.kind !== 'stale_connection_ignored') {
+        updatedVenue = 'BINANCE';
+      }
       if (res.kind === 'bridge_ready') {
         this.bnInGapRecovery = false;
         this.binanceBridges.push(res.proof);
       }
     } else if (ev.type === 'bn_depth_delta') {
-      updatedVenue = 'BINANCE';
       const res = this.bnMachine.onDepthDelta({
         connGen: ev.connGen,
         recvSeq: ev.recvSeq,
@@ -1202,6 +1289,9 @@ export class StreamingReplayRunner {
         bids: ev.bids,
         asks: ev.asks,
       });
+      if (res.kind !== 'stale_connection_ignored') {
+        updatedVenue = 'BINANCE';
+      }
       if (res.kind === 'bridge_ready') {
         this.bnInGapRecovery = false;
         this.binanceBridges.push(res.proof);
@@ -1218,7 +1308,6 @@ export class StreamingReplayRunner {
         this.bnMachine.markGapResyncing();
       }
     } else if (ev.type === 'hl_l2book') {
-      updatedVenue = 'HYPERLIQUID';
       const res = this.hlMachine.onSnapshot({
         connGen: ev.connGen,
         sourceTs: ev.sourceTs,
@@ -1226,6 +1315,9 @@ export class StreamingReplayRunner {
         bids: ev.bids,
         asks: ev.asks,
       });
+      if (res.kind !== 'stale_connection_ignored') {
+        updatedVenue = 'HYPERLIQUID';
+      }
       if (res.kind === 'applied' && res.firstForConnection && ev.connGen > 1) {
         this.hlReconnectFirstValid.push({
           recvTs: ev.recvTs,
@@ -1644,7 +1736,9 @@ export class StreamingReplayRunner {
       .plus(execExit.longCloseFill.feeUsdt)
       .plus(execExit.shortCloseFill.feeUsdt);
     const funding = computeFundingBreakdown({
-      liveSettledFunding: this.liveSettledFunding,
+      liveSettledFunding: this.hasPreloadedAccountingIndex
+        ? this.accountingLiveSettlements
+        : this.liveSettledFunding,
       direction: pos.direction,
       qtyEth: this.config.plannedQtyEth,
       entryTs: pos.entryExecTs,
@@ -1932,7 +2026,9 @@ export class StreamingReplayRunner {
         const pos = variant.openPosition;
         const targetRow = pos.openRow;
         const funding = computeFundingBreakdown({
-          liveSettledFunding: this.liveSettledFunding,
+          liveSettledFunding: this.hasPreloadedAccountingIndex
+            ? this.accountingLiveSettlements
+            : this.liveSettledFunding,
           direction: pos.direction,
           qtyEth: this.config.plannedQtyEth,
           entryTs: pos.entryExecTs,
@@ -1999,7 +2095,7 @@ export class StreamingReplayRunner {
             });
           }
         } else {
-          const reason = `FINAL_BOOK_INVALID_${!bnEndCheck.valid ? `BN_${bnEndCheck.reason}` : `HL_${hlEndCheck.valid ? 'OK' : hlEndCheck.reason}`}`;
+          const reason = formatInvalidBookPairReason(bnEndCheck, hlEndCheck, 'FINAL_BOOK_INVALID_');
           targetRow.unvalued_qty = this.config.plannedQtyEth;
           targetRow.manual_notes += `; Unvalued at end: ${reason}`;
           unvaluedOpenPositions.push({
@@ -2015,6 +2111,10 @@ export class StreamingReplayRunner {
         }
         variant.openPosition = null;
         this.emitFinalizedRow(variant, targetRow);
+      }
+
+      if (!this.hasPreloadedAccountingIndex && this.liveSettledFunding.length > 0) {
+        this.reconcileClosedRowsFunding(variant);
       }
 
       for (const row of variant.rows) {
@@ -2092,6 +2192,11 @@ export class StreamingReplayRunner {
           : [],
         liveSettledFundingCount: this.liveSettledFunding.length,
         historicalBackfillFundingCount: this.historicalBackfillCount,
+        crossFormatPriceUpdates: {
+          binance: this.bnMachine.getCrossFormatMutationCount(),
+          hyperliquid: this.hlMachine.getCrossFormatMutationCount(),
+          total: this.bnMachine.getCrossFormatMutationCount() + this.hlMachine.getCrossFormatMutationCount(),
+        },
         coverageByAgeTier,
       },
       summaries,
@@ -2100,6 +2205,65 @@ export class StreamingReplayRunner {
       unvaluedOpenPositions,
       sampleDelayComparison: buildSampleDelayComparison(allRows.length > 0 ? allRows : this.delaySampleRows),
     };
+  }
+
+  private reconcileClosedRowsFunding(variant: VariantCheckpoint): void {
+    const m = variant.metrics;
+    for (const row of variant.rows) {
+      if (
+        row.decision !== 'TRIGGERED'
+        || row.is_open_at_end
+        || row.exec_arrival_ts === null
+        || row.exit_exec_arrival_ts === null
+        || !row.exit_long_fill
+        || !row.exit_short_fill
+      ) {
+        continue;
+      }
+      const fallbackBnPriceUsdt = row.exit_long_fill.venue === 'BINANCE'
+        ? row.exit_long_fill.avgPriceNative
+        : row.exit_short_fill.avgPriceNative;
+      const fallbackHlPriceUsdc = row.exit_long_fill.venue === 'HYPERLIQUID'
+        ? row.exit_long_fill.avgPriceNative
+        : row.exit_short_fill.avgPriceNative;
+      const funding = computeFundingBreakdown({
+        liveSettledFunding: this.liveSettledFunding,
+        direction: row.direction,
+        qtyEth: row.planned_qty,
+        entryTs: row.exec_arrival_ts,
+        exitTs: row.exit_exec_arrival_ts,
+        fallbackBnPriceUsdt,
+        fallbackHlPriceUsdc,
+        fallbackFxRate: row.fx_usdc_usdt,
+        fallbackFxSource: row.fx_source,
+      });
+      const prevNet = row.funding_net_usd ?? '0';
+      if (funding.count === row.funding_events_crossed && funding.netUsd === prevNet) {
+        continue;
+      }
+      const delta = new Decimal(funding.netUsd).minus(prevNet);
+      row.funding_events_crossed = funding.count;
+      row.funding_net_usd = funding.netUsd;
+      row.funding_legs = funding.legs;
+      const nextRoundtripNet = new Decimal(row.contract_spread_pnl_usd ?? '0')
+        .plus(funding.netUsd)
+        .minus(row.fees_4leg_usd ?? '0');
+      row.roundtrip_net_pnl_usd = nextRoundtripNet.toDecimalPlaces(8).toString();
+      if (row.planned_notional_usdt) {
+        row.roundtrip_net_bps = nextRoundtripNet
+          .div(row.planned_notional_usdt)
+          .mul(10_000)
+          .toDecimalPlaces(4)
+          .toString();
+      }
+      row.budget_roi_pct = nextRoundtripNet
+        .div(this.config.budgetUsdt)
+        .mul(100)
+        .toDecimalPlaces(4)
+        .toString();
+      m.totalFundingNetUsd = new Decimal(m.totalFundingNetUsd).plus(delta).toString();
+      m.realizedPnlUsd = new Decimal(m.realizedPnlUsd).plus(delta).toString();
+    }
   }
 }
 
@@ -2172,7 +2336,8 @@ export function runPhase1Replay(
   partialConfig: Partial<ReplayConfig> = {},
 ): ReplaySuiteResult {
   const ordered = [...events].sort((a, b) => a.recvTs - b.recvTs || a.recvSeq - b.recvSeq);
-  const runner = new StreamingReplayRunner(partialConfig);
+  const preloadedFundingSettlements = extractFundingSettlementsFromEvents(ordered);
+  const runner = new StreamingReplayRunner(partialConfig, undefined, { preloadedFundingSettlements });
   for (const ev of ordered) {
     runner.processEvent(ev);
   }
@@ -2184,7 +2349,12 @@ export async function runPhase1ReplayStream(
   partialConfig: Partial<ReplayConfig> = {},
   options: StreamingReplayOptions = {},
 ): Promise<ReplaySuiteResult> {
-  const runner = new StreamingReplayRunner(partialConfig, undefined, options);
+  const preloadedFundingSettlements = options.preloadedFundingSettlements
+    ?? await extractFundingSettlementsFromFile(ndjsonPath);
+  const runner = new StreamingReplayRunner(partialConfig, undefined, {
+    ...options,
+    preloadedFundingSettlements,
+  });
   const rl = createInterface({
     input: createReadStream(ndjsonPath, { encoding: 'utf8' }),
     crlfDelay: Infinity,

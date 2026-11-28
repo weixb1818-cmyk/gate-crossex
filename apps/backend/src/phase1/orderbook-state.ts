@@ -102,34 +102,65 @@ export type BinanceSnapshotResult =
     };
 
 interface SortedEntry {
+  key: string;
   priceNum: number;
   price: string;
   qty: string;
 }
 
+const SIMPLE_DECIMAL_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+
+/**
+ * Normalize a numeric price string to its canonical exact decimal key so
+ * formatting differences such as "100.00" vs "100.0" collapse to one level
+ * without losing arbitrary precision.
+ */
+export function canonicalPriceKey(rawPrice: string): string {
+  const trimmed = rawPrice.trim();
+  if (!SIMPLE_DECIMAL_RE.test(trimmed)) {
+    return new Decimal(trimmed).toString();
+  }
+  let negative = false;
+  let unsigned = trimmed;
+  if (unsigned.startsWith('-')) {
+    negative = true;
+    unsigned = unsigned.slice(1);
+  } else if (unsigned.startsWith('+')) {
+    unsigned = unsigned.slice(1);
+  }
+  const dotIdx = unsigned.indexOf('.');
+  let intPart = (dotIdx >= 0 ? unsigned.slice(0, dotIdx) : unsigned).replace(/^0+/, '');
+  if (intPart.length === 0) intPart = '0';
+  const fracPart = dotIdx >= 0 ? unsigned.slice(dotIdx + 1).replace(/0+$/, '') : '';
+  if (intPart === '0' && fracPart.length === 0) return '0';
+  const body = fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
+  return negative ? `-${body}` : body;
+}
+
 function compareSidePrices(
   aNum: number,
-  aStr: string,
+  aKey: string,
   bNum: number,
-  bStr: string,
+  bKey: string,
   descending: boolean,
 ): number {
   if (aNum !== bNum) {
     return descending ? (aNum > bNum ? -1 : 1) : (aNum < bNum ? -1 : 1);
   }
-  if (aStr === bStr) return 0;
-  const cmp = new Decimal(aStr).cmp(bStr);
+  if (aKey === bKey) return 0;
+  const cmp = new Decimal(aKey).cmp(bKey);
   return descending ? -cmp : cmp;
 }
 
 /**
  * Incrementally maintained sorted single-side book (`bids` desc or `asks` asc).
- * Price-level mutations are O(log N) binary searches instead of full O(N log N)
- * re-sorts, enabling million-event offline replays in constant low memory.
+ * Price-level mutations are keyed by exact canonical decimal value and O(log N)
+ * binary searches instead of full O(N log N) re-sorts, preserving precision.
  */
 export class SortedBookSide {
-  private readonly levels = new Map<string, string>();
+  private readonly levels = new Map<string, SortedEntry>();
   private entries: SortedEntry[] = [];
+  private crossFormatMutationCount = 0;
 
   constructor(private readonly descending: boolean) {}
 
@@ -138,10 +169,18 @@ export class SortedBookSide {
     this.entries = [];
   }
 
+  getCrossFormatMutationCount(): number {
+    return this.crossFormatMutationCount;
+  }
+
   clone(): SortedBookSide {
     const copy = new SortedBookSide(this.descending);
-    for (const [k, v] of this.levels) copy.levels.set(k, v);
-    copy.entries = this.entries.map((entry) => ({ ...entry }));
+    copy.crossFormatMutationCount = this.crossFormatMutationCount;
+    copy.entries = this.entries.map((entry) => {
+      const cloned = { ...entry };
+      copy.levels.set(cloned.key, cloned);
+      return cloned;
+    });
     return copy;
   }
 
@@ -156,20 +195,22 @@ export class SortedBookSide {
 
   loadSnapshot(updates: readonly PriceLevel[]): void {
     this.levels.clear();
-    const next: SortedEntry[] = [];
     for (const [price, qty] of updates) {
       const qNum = Number(qty);
-      if (qty === '0' || (Number.isFinite(qNum) ? qNum <= 0 : new Decimal(qty).lte(0))) continue;
-      if (!this.levels.has(price)) {
-        next.push({ priceNum: Number(price), price, qty });
+      const isRemoval = qty === '0' || (Number.isFinite(qNum) ? qNum <= 0 : new Decimal(qty).lte(0));
+      const key = canonicalPriceKey(price);
+      const prev = this.levels.get(key);
+      if (prev && prev.price !== price) {
+        this.crossFormatMutationCount += 1;
       }
-      this.levels.set(price, qty);
+      if (isRemoval) {
+        this.levels.delete(key);
+        continue;
+      }
+      this.levels.set(key, { key, priceNum: Number(key), price, qty });
     }
-    // Deduplicate if overwritten in same snapshot array.
-    const dedup = next.length === this.levels.size
-      ? next
-      : [...this.levels.entries()].map(([price, qty]) => ({ priceNum: Number(price), price, qty }));
-    dedup.sort((a, b) => compareSidePrices(a.priceNum, a.price, b.priceNum, b.price, this.descending));
+    const dedup = [...this.levels.values()];
+    dedup.sort((a, b) => compareSidePrices(a.priceNum, a.key, b.priceNum, b.key, this.descending));
     this.entries = dedup;
   }
 
@@ -177,26 +218,32 @@ export class SortedBookSide {
     for (const [price, qty] of updates) {
       const qNum = Number(qty);
       const isRemoval = qty === '0' || (Number.isFinite(qNum) ? qNum <= 0 : new Decimal(qty).lte(0));
-      const priceNum = Number(price);
+      const key = canonicalPriceKey(price);
+      const existing = this.levels.get(key);
 
       if (isRemoval) {
-        if (!this.levels.delete(price)) continue;
-        const idx = this.findIndex(priceNum, price);
+        if (!existing) continue;
+        if (existing.price !== price) {
+          this.crossFormatMutationCount += 1;
+        }
+        this.levels.delete(key);
+        const idx = this.findIndex(existing.priceNum, existing.key);
         if (idx >= 0) this.entries.splice(idx, 1);
         continue;
       }
 
-      const existed = this.levels.has(price);
-      this.levels.set(price, qty);
-      if (existed) {
-        const idx = this.findIndex(priceNum, price);
-        if (idx >= 0) {
-          this.entries[idx]!.qty = qty;
-          continue;
+      if (existing) {
+        if (existing.price !== price) {
+          this.crossFormatMutationCount += 1;
         }
+        existing.price = price;
+        existing.qty = qty;
+        continue;
       }
-      const insertAt = this.findInsertionIndex(priceNum, price);
-      this.entries.splice(insertAt, 0, { priceNum, price, qty });
+      const entry: SortedEntry = { key, priceNum: Number(key), price, qty };
+      this.levels.set(key, entry);
+      const insertAt = this.findInsertionIndex(entry.priceNum, key);
+      this.entries.splice(insertAt, 0, entry);
     }
   }
 
@@ -266,13 +313,13 @@ export class SortedBookSide {
     };
   }
 
-  private findIndex(priceNum: number, priceStr: string): number {
+  private findIndex(priceNum: number, priceKey: string): number {
     let lo = 0;
     let hi = this.entries.length - 1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
       const cur = this.entries[mid]!;
-      const cmp = compareSidePrices(cur.priceNum, cur.price, priceNum, priceStr, this.descending);
+      const cmp = compareSidePrices(cur.priceNum, cur.key, priceNum, priceKey, this.descending);
       if (cmp === 0) return mid;
       if (cmp < 0) lo = mid + 1;
       else hi = mid - 1;
@@ -280,13 +327,13 @@ export class SortedBookSide {
     return -1;
   }
 
-  private findInsertionIndex(priceNum: number, priceStr: string): number {
+  private findInsertionIndex(priceNum: number, priceKey: string): number {
     let lo = 0;
     let hi = this.entries.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
       const cur = this.entries[mid]!;
-      const cmp = compareSidePrices(cur.priceNum, cur.price, priceNum, priceStr, this.descending);
+      const cmp = compareSidePrices(cur.priceNum, cur.key, priceNum, priceKey, this.descending);
       if (cmp < 0) lo = mid + 1;
       else hi = mid;
     }
@@ -301,6 +348,7 @@ function toBigInt(value: string | number | bigint): bigint {
 export interface BinanceBookCheckpoint {
   status: BinanceBookStatus;
   connGen: number;
+  hasOpened?: boolean;
   lastAppliedU: string | null;
   lastSourceTs: number;
   lastRecvTs: number;
@@ -316,6 +364,7 @@ export interface BinanceBookCheckpoint {
 export class BinanceOrderBookStateMachine {
   private status: BinanceBookStatus = 'UNSYNCED';
   private connGen = 0;
+  private hasOpened = false;
   private buffer: BinanceDepthDeltaEvent[] = [];
   private pendingSnapshot: BinanceDepthSnapshotInput | null = null;
   private droppedSincePending = 0;
@@ -325,6 +374,7 @@ export class BinanceOrderBookStateMachine {
   private lastAppliedU: bigint | null = null;
   private lastSourceTs = 0;
   private lastRecvTs = 0;
+  private archivedCrossFormatMutations = 0;
 
   constructor(private readonly maxBufferLength = 5_000) {}
 
@@ -334,6 +384,12 @@ export class BinanceOrderBookStateMachine {
 
   getConnectionGeneration(): number {
     return this.connGen;
+  }
+
+  getCrossFormatMutationCount(): number {
+    return this.archivedCrossFormatMutations
+      + this.bids.getCrossFormatMutationCount()
+      + this.asks.getCrossFormatMutationCount();
   }
 
   getDiagnostics(): {
@@ -356,6 +412,7 @@ export class BinanceOrderBookStateMachine {
     return {
       status: this.status,
       connGen: this.connGen,
+      hasOpened: this.hasOpened,
       lastAppliedU: this.lastAppliedU === null ? null : this.lastAppliedU.toString(),
       lastSourceTs: this.lastSourceTs,
       lastRecvTs: this.lastRecvTs,
@@ -368,6 +425,7 @@ export class BinanceOrderBookStateMachine {
   restoreCheckpoint(cp: BinanceBookCheckpoint): void {
     this.status = cp.status;
     this.connGen = cp.connGen;
+    this.hasOpened = cp.hasOpened ?? (cp.connGen > 0 || cp.status !== 'UNSYNCED');
     this.lastAppliedU = cp.lastAppliedU === null ? null : BigInt(cp.lastAppliedU);
     this.lastSourceTs = cp.lastSourceTs;
     this.lastRecvTs = cp.lastRecvTs;
@@ -390,7 +448,11 @@ export class BinanceOrderBookStateMachine {
     return overflowed;
   }
 
-  onConnectionOpen(connGen: number): void {
+  onConnectionOpen(connGen: number): boolean {
+    if (this.hasOpened && connGen <= this.connGen) {
+      return false;
+    }
+    this.hasOpened = true;
     this.connGen = connGen;
     this.status = 'BUFFERING';
     this.buffer = [];
@@ -399,6 +461,21 @@ export class BinanceOrderBookStateMachine {
     this.bids.clear();
     this.asks.clear();
     this.lastAppliedU = null;
+    return true;
+  }
+
+  onConnectionDisconnect(connGen: number): boolean {
+    if (!this.hasOpened || connGen !== this.connGen) {
+      return false;
+    }
+    this.status = 'UNSYNCED';
+    this.buffer = [];
+    this.pendingSnapshot = null;
+    this.droppedSincePending = 0;
+    this.bids.clear();
+    this.asks.clear();
+    this.lastAppliedU = null;
+    return true;
   }
 
   markGapResyncing(): void {
@@ -591,6 +668,7 @@ export class BinanceOrderBookStateMachine {
       lastEvent = event;
     }
 
+    this.archivedCrossFormatMutations += this.bids.getCrossFormatMutationCount() + this.asks.getCrossFormatMutationCount();
     this.bids = nextBids;
     this.asks = nextAsks;
     this.lastAppliedU = appliedU;
@@ -666,7 +744,7 @@ export interface HyperliquidL2SnapshotInput {
   asks: PriceLevel[];
 }
 
-export type HyperliquidBookStatus = 'WAITING_SNAPSHOT' | 'SYNCED';
+export type HyperliquidBookStatus = 'WAITING_SNAPSHOT' | 'SYNCED' | 'DISCONNECTED';
 
 export type HyperliquidSnapshotResult =
   | { kind: 'stale_connection_ignored'; status: HyperliquidBookStatus }
@@ -682,6 +760,7 @@ export type HyperliquidSnapshotResult =
 export interface HyperliquidBookCheckpoint {
   status: HyperliquidBookStatus;
   connGen: number;
+  hasOpened?: boolean;
   lastSourceTs: number;
   appliedInCurrentConn: number;
   book: NormalizedOrderBook | null;
@@ -689,11 +768,13 @@ export interface HyperliquidBookCheckpoint {
 
 /**
  * Deterministic Hyperliquid L2 order book state machine. Each valid snapshot replaces
- * the full visible book (preserving exact level count without extrapolating past depth).
+ * the full visible book (preserving exact level count without extrapolating past depth)
+ * and invalidates immediately when the active connection generation disconnects.
  */
 export class HyperliquidOrderBookStateMachine {
   private status: HyperliquidBookStatus = 'WAITING_SNAPSHOT';
   private connGen = 0;
+  private hasOpened = false;
   private lastSourceTs = 0;
   private bids = new SortedBookSide(true);
   private asks = new SortedBookSide(false);
@@ -708,10 +789,15 @@ export class HyperliquidOrderBookStateMachine {
     return this.connGen;
   }
 
+  getCrossFormatMutationCount(): number {
+    return this.bids.getCrossFormatMutationCount() + this.asks.getCrossFormatMutationCount();
+  }
+
   exportCheckpoint(): HyperliquidBookCheckpoint {
     return {
       status: this.status,
       connGen: this.connGen,
+      hasOpened: this.hasOpened,
       lastSourceTs: this.lastSourceTs,
       appliedInCurrentConn: this.appliedInCurrentConn,
       book: this.currentBook ? { ...this.currentBook } : null,
@@ -721,10 +807,11 @@ export class HyperliquidOrderBookStateMachine {
   restoreCheckpoint(cp: HyperliquidBookCheckpoint): void {
     this.status = cp.status;
     this.connGen = cp.connGen;
+    this.hasOpened = cp.hasOpened ?? (cp.connGen > 0 || cp.status === 'SYNCED');
     this.lastSourceTs = cp.lastSourceTs;
     this.appliedInCurrentConn = cp.appliedInCurrentConn;
     this.currentBook = cp.book;
-    if (cp.book) {
+    if (cp.status === 'SYNCED' && cp.book) {
       this.bids.loadSnapshot(cp.book.bids);
       this.asks.loadSnapshot(cp.book.asks);
     } else {
@@ -733,7 +820,11 @@ export class HyperliquidOrderBookStateMachine {
     }
   }
 
-  onConnectionOpen(connGen: number): void {
+  onConnectionOpen(connGen: number): boolean {
+    if (this.hasOpened && connGen <= this.connGen) {
+      return false;
+    }
+    this.hasOpened = true;
     this.connGen = connGen;
     this.status = 'WAITING_SNAPSHOT';
     this.lastSourceTs = 0;
@@ -741,10 +832,23 @@ export class HyperliquidOrderBookStateMachine {
     this.asks.clear();
     this.currentBook = null;
     this.appliedInCurrentConn = 0;
+    return true;
+  }
+
+  onConnectionDisconnect(connGen: number): boolean {
+    if (!this.hasOpened || connGen !== this.connGen) {
+      return false;
+    }
+    this.status = 'DISCONNECTED';
+    this.bids.clear();
+    this.asks.clear();
+    this.currentBook = null;
+    this.appliedInCurrentConn = 0;
+    return true;
   }
 
   onSnapshot(input: HyperliquidL2SnapshotInput): HyperliquidSnapshotResult {
-    if (input.connGen !== this.connGen) {
+    if (!this.hasOpened || input.connGen !== this.connGen || this.status === 'DISCONNECTED') {
       return { kind: 'stale_connection_ignored', status: this.status };
     }
     if (this.appliedInCurrentConn > 0) {

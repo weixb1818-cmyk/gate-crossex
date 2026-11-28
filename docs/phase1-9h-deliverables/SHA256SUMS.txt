@@ -1,0 +1,12 @@
+cb2abec6e39c0acc6f180c5c0ab111a3ab8a3f8c4928427c6b03fc23f5002ca1  .local-data/phase1/long-run-20261127-1428/events.ndjson
+e0632de0571811101720dc284226226f58324cbd972ee38fb9850d0d4461a9a4  .local-data/phase1/long-run-20261127-1428/manifest.json
+08f65c09c44d82411c00b4ff03a33c01cc90298578d4bbf8b2bc31d5c8cdbec9  .local-data/phase1/long-run-20261127-1428/replay-9.3-v2/funding_legs.csv
+606fde85cd05669826481bc29cce4b93fa6aa6a721f2abb14e87af08dd80ba22  .local-data/phase1/long-run-20261127-1428/replay-9.3-v2/report.md
+4c09a6e77df1bc1ef5edff0c950efe4b6b26edf549bfc57119197ec50b6baafc  .local-data/phase1/long-run-20261127-1428/replay-9.3-v2/scorecard.json
+a3b74ec96a3985d2e23e5e938ab98531f257344127d58ad7fb3c27a6ada56aec  .local-data/phase1/long-run-20261127-1428/replay-9.3-v2/trades.csv
+e0632de0571811101720dc284226226f58324cbd972ee38fb9850d0d4461a9a4  docs/phase1-9h-deliverables/manifest.json
+606fde85cd05669826481bc29cce4b93fa6aa6a721f2abb14e87af08dd80ba22  docs/phase1-9h-deliverables/report.md
+08f65c09c44d82411c00b4ff03a33c01cc90298578d4bbf8b2bc31d5c8cdbec9  docs/phase1-9h-deliverables/funding_legs.csv
+d16b5f45b930e9896c1fac171214504520d8bdc762bab5f4177f179f00d3face  docs/phase1-9h-deliverables/comparison-before-after.json
+3136b412631beaa8c650cffa47fca14033307488a02d30486555174a4b8b7f8c  docs/phase1-9h-deliverables/scorecard.json.gz
+89ad00966c58f9a5dd85d056d87f51df6e895f3815475ab497559f860354e4d7  docs/phase1-9h-deliverables/trades.csv.gz

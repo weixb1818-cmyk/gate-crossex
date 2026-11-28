@@ -1,0 +1,82 @@
+{
+  "outputDir": "/home/ubuntu/gatex/gate-crossex/.local-data/phase1/long-run-20261127-1428",
+  "eventsPath": "/home/ubuntu/gatex/gate-crossex/.local-data/phase1/long-run-20261127-1428/events.ndjson",
+  "manifestPath": "/home/ubuntu/gatex/gate-crossex/.local-data/phase1/long-run-20261127-1428/manifest.json",
+  "startedAtIso": "2026-11-27T06:28:57.759Z",
+  "endedAtIso": "2026-11-27T15:28:58.176Z",
+  "durationMs": 32400417,
+  "totalEvents": 2622792,
+  "countsByType": {
+    "session_meta": 1,
+    "conn_event": 17,
+    "fx_rate": 1081,
+    "funding_pred": 2162,
+    "funding_settled": 49,
+    "cx_raw": 2297179,
+    "hl_l2book": 2634,
+    "hl_book_state": 2634,
+    "bn_depth_delta": 317031,
+    "bn_depth_snapshot": 2,
+    "bn_book_state": 2
+  },
+  "catalog": {
+    "fetchedAt": "2026-11-27T06:28:58.078Z",
+    "asset": "ETH",
+    "commonLotStep": "0.001",
+    "commonMinNotionalUsd": "20",
+    "unitMultiplier": "1",
+    "crossexRules": [
+      {
+        "symbol": "GATE_FUTURE_ETH_USDT",
+        "exchangeType": "GATE",
+        "businessType": "FUTURE",
+        "state": "live",
+        "minSize": "0.001",
+        "minNotional": null,
+        "lotSize": "0.001",
+        "tickSize": "0.01",
+        "maxMarketSize": "100000",
+        "maxLimitSize": "100000",
+        "contractSize": null
+      },
+      {
+        "symbol": "HYPERLIQUID_FUTURE_ETH_USDC",
+        "exchangeType": "HYPERLIQUID",
+        "businessType": "FUTURE",
+        "state": "live",
+        "minSize": "0.0001",
+        "minNotional": "10",
+        "lotSize": "0.0001",
+        "tickSize": "0.01",
+        "maxMarketSize": null,
+        "maxLimitSize": null,
+        "contractSize": null
+      },
+      {
+        "symbol": "BINANCE_FUTURE_ETH_USDT",
+        "exchangeType": "BINANCE",
+        "businessType": "FUTURE",
+        "state": "live",
+        "minSize": "0.001",
+        "minNotional": "20",
+        "lotSize": "0.001",
+        "tickSize": "0.01",
+        "maxMarketSize": "2000",
+        "maxLimitSize": "10000",
+        "contractSize": null
+      }
+    ],
+    "binanceExchangeInfo": {
+      "symbol": "ETHUSDT",
+      "stepSize": "0.001",
+      "tickSize": "0.01",
+      "minQty": "0.001",
+      "minNotional": "20"
+    },
+    "hyperliquidMeta": {
+      "coin": "ETH",
+      "szDecimals": 4,
+      "maxLeverage": 25
+    }
+  }
+}

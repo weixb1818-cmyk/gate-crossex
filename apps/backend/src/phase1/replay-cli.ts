@@ -112,6 +112,67 @@ function renderScorecardCsvRow(row: TradeScorecardRow): string {
   return `${SCORECARD_CSV_HEADERS.map((h) => csvEscape(row[h])).join(',')}\n`;
 }
 
+const FUNDING_LEGS_CSV_HEADERS = [
+  'run_id',
+  'age_tier',
+  'entry_bps_threshold',
+  'strategy_version',
+  'delay_ms',
+  'opportunity_id',
+  'group_id',
+  'direction',
+  'is_open_at_end',
+  'entry_exec_ts',
+  'exit_exec_ts',
+  'venue',
+  'position_side',
+  'settlement_time',
+  'settlement_time_iso',
+  'funding_rate',
+  'qty_eth',
+  'ref_price_native',
+  'price_currency',
+  'price_source',
+  'fx_rate',
+  'fx_source',
+  'cashflow_native',
+  'cashflow_usdt',
+] as const;
+
+function renderFundingLegCsvRows(row: TradeScorecardRow): string[] {
+  if (row.decision !== 'TRIGGERED' || row.funding_legs.length === 0) return [];
+  return row.funding_legs.map((leg) => {
+    const positionSide = leg.venue === row.long_venue ? 'LONG' : 'SHORT';
+    const fields = [
+      row.run_id,
+      row.age_tier,
+      row.entry_bps_threshold,
+      row.strategy_version,
+      row.delay_ms,
+      row.opportunity_id,
+      row.group_id,
+      row.direction,
+      row.is_open_at_end,
+      row.exec_arrival_ts,
+      row.exit_exec_arrival_ts,
+      leg.venue,
+      positionSide,
+      leg.settlementTime,
+      new Date(leg.settlementTime).toISOString(),
+      leg.fundingRate,
+      leg.qtyEth,
+      leg.refPriceNative,
+      leg.priceCurrency,
+      leg.priceSource,
+      leg.fxRate,
+      leg.fxSource,
+      leg.cashflowNative,
+      leg.cashflowUsdt,
+    ];
+    return `${fields.map((v) => csvEscape(v)).join(',')}\n`;
+  });
+}
+
 export function renderAuditMarkdownReport(result: ReplaySuiteResult, eventsPath: string): string {
   const d = result.timelineDiagnostics;
   const firstBridge = d.binanceBridges[0] ?? null;
@@ -132,6 +193,7 @@ export function renderAuditMarkdownReport(result: ReplaySuiteResult, eventsPath:
     `- **CrossEx Bypass Frames Captured**: ${d.crossexBypassCount}`,
     `- **Binance Sequence Gaps**: ${d.binanceGapCount} | **Hyperliquid Stale Backward Rejected**: ${d.hyperliquidStaleRejectedCount}`,
     `- **Funding Settlement Records**: live=${d.liveSettledFundingCount} | historicalBackfill=${d.historicalBackfillFundingCount}`,
+    `- **Cross-Format Same-Price Book Updates**: total=${d.crossFormatPriceUpdates.total} (binance=${d.crossFormatPriceUpdates.binance}, hyperliquid=${d.crossFormatPriceUpdates.hyperliquid})`,
     '',
     '## 1. Fee & Denominator Assumptions',
     '',
@@ -233,11 +295,15 @@ async function main(): Promise<void> {
   mkdirSync(outDir, { recursive: true });
   const jsonPath = join(outDir, 'scorecard.json');
   const csvPath = join(outDir, 'trades.csv');
+  const fundingLegsPath = join(outDir, 'funding_legs.csv');
   const mdPath = join(outDir, 'report.md');
 
   const csvStream = createWriteStream(csvPath, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
   csvStream.write(`${SCORECARD_CSV_HEADERS.join(',')}\n`);
+  const fundingLegsStream = createWriteStream(fundingLegsPath, { encoding: 'utf8', highWaterMark: 256 * 1024 });
+  fundingLegsStream.write(`${FUNDING_LEGS_CSV_HEADERS.join(',')}\n`);
   let csvRowsWritten = 0;
+  let fundingLegRowsWritten = 0;
 
   const result = await runPhase1ReplayStream(
     inputPath,
@@ -259,12 +325,17 @@ async function main(): Promise<void> {
       onFinalizedRow: (row) => {
         csvRowsWritten += 1;
         csvStream.write(renderScorecardCsvRow(row));
+        for (const legLine of renderFundingLegCsvRows(row)) {
+          fundingLegRowsWritten += 1;
+          fundingLegsStream.write(legLine);
+        }
       },
     },
   );
 
   csvStream.end();
-  await once(csvStream, 'finish');
+  fundingLegsStream.end();
+  await Promise.all([once(csvStream, 'finish'), once(fundingLegsStream, 'finish')]);
 
   writeFileSync(jsonPath, JSON.stringify(result, null, 2));
   writeFileSync(mdPath, renderAuditMarkdownReport(result, inputPath));
@@ -272,8 +343,10 @@ async function main(): Promise<void> {
   console.log(JSON.stringify({
     jsonPath,
     csvPath,
+    fundingLegsPath,
     mdPath,
     csvRowsWritten,
+    fundingLegRowsWritten,
     coverageByAgeTier: result.timelineDiagnostics.coverageByAgeTier,
     summaries: result.summaries,
     inFlightOrdersAtEnd: result.inFlightOrdersAtEnd.length,
@@ -285,6 +358,7 @@ async function main(): Promise<void> {
       hlReconnects: result.timelineDiagnostics.hyperliquidReconnectFirstValid.length,
       liveSettledFundingCount: result.timelineDiagnostics.liveSettledFundingCount,
       historicalBackfillFundingCount: result.timelineDiagnostics.historicalBackfillFundingCount,
+      crossFormatPriceUpdates: result.timelineDiagnostics.crossFormatPriceUpdates,
     },
   }, null, 2));
 }
