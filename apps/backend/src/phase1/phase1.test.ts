@@ -13,9 +13,13 @@ import { stripProcessProxyEnv } from './proxy-free.js';
 import { Phase1MarketRecorder } from './recorder.js';
 import {
   StreamingReplayRunner,
+  buildVariantHourlyBreakdown,
+  computeCounterfactualFeeImpactOnFixedTrades,
   evaluateBookValidity,
+  resolveFeeScheduleFromSnapshot,
   runPhase1Replay,
   runPhase1ReplayStream,
+  type ReplayCheckpoint,
 } from './replay.js';
 import type { RecordedMarketEvent } from './types.js';
 
@@ -1848,5 +1852,191 @@ describe('Phase 1 Section 16.2 streaming & mid-bridge checkpoint regressions', (
         });
       }
     }
+  });
+});
+
+describe('Phase 1 Section 21 upgrade compatibility, fee snapshot, counterfactual, and hourly breakdown', () => {
+  it('throws an explicit replay-from-raw error when restoring a legacy ddf3d81 checkpoint containing raw deferredTriggeredRows', () => {
+    const baseRunner = new StreamingReplayRunner();
+    const baseCp = JSON.parse(JSON.stringify(baseRunner.exportCheckpoint())) as ReplayCheckpoint;
+    const dummySample = runPhase1Replay([
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['100.0', '5']],
+        asks: [['100.1', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['100.0', '5']],
+        asks: [['100.1', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1010,
+        sourceTs: 1005,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['105.0', '5']],
+        asks: [['105.1', '5']],
+      },
+    ], { hlMaxAgeMsList: [15_000], entryBpsList: ['2'], delaysMs: [0] });
+
+    const legacyRawRow = dummySample.rows[0]!;
+    // Simulate ddf3d81-era checkpoint where deferredTriggeredRows contained plain TradeScorecardRow objects.
+    const incompatibleCp = {
+      ...baseCp,
+      variants: [
+        {
+          ...baseCp.variants[0]!,
+          deferredTriggeredRows: [legacyRawRow as unknown as NonNullable<ReplayCheckpoint['variants'][0]['deferredTriggeredRows']>[number]],
+        },
+        ...baseCp.variants.slice(1),
+      ],
+    } as ReplayCheckpoint;
+
+    expect(() => StreamingReplayRunner.fromCheckpoint(incompatibleCp)).toThrow(
+      /Incompatible legacy ReplayCheckpoint format.*replay from the raw events\.ndjson/,
+    );
+  });
+
+  it('resolves CrossEx fee snapshots (specialFees priority + venue default fallback), counterfactual fixed-trade deltas, and hourly buckets', () => {
+    const feeSchedule = resolveFeeScheduleFromSnapshot({
+      source: 'account_api',
+      fetchedAt: '2026-11-28T09:00:00.000Z',
+      isHistoricalRetrospective: true,
+      fees: [
+        {
+          exchange_type: 'BINANCE',
+          future_maker_fee: '0.00018',
+          future_taker_fee: '0.00045',
+          special_fee_list: [
+            { symbol: 'BINANCE_FUTURE_BTC_USDT', maker_fee_rate: '0.0001', taker_fee_rate: '0.0002' },
+            { symbol: 'BINANCE_FUTURE_ETH_USDT', maker_fee_rate: '0.00015', taker_fee_rate: '0.0004' },
+          ],
+        },
+        {
+          venue: 'HYPERLIQUID',
+          futureMakerFee: '0.00015',
+          futureTakerFee: '0.0004',
+          specialFees: [],
+        },
+      ],
+    });
+
+    expect(feeSchedule).toMatchObject({
+      source: 'account_api',
+      binanceTakerFeeRate: '0.0004',
+      binanceMatchedBy: 'special_fee',
+      hyperliquidTakerFeeRate: '0.0004',
+      hyperliquidMatchedBy: 'venue_future_default',
+      isHistoricalRetrospective: true,
+    });
+
+    const events: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1_000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1_000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1_000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1_000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['1999.0', '5']],
+        asks: [['2000.0', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1_000,
+        lastUpdateId: '100',
+        bids: [['1999.0', '5']],
+        asks: [['2000.0', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 2_000,
+        sourceTs: 1_990,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['2005.0', '5']],
+        asks: [['2005.2', '5']],
+      },
+      // Close inside next hour (t=3_605_000): spread convergence to 0.
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 7,
+        recvTs: 3_605_000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 3_604_990,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [['2002.5', '5'], ['1999.0', '0']],
+        asks: [['2002.6', '5'], ['2000.0', '0']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 8,
+        recvTs: 3_605_010,
+        sourceTs: 3_605_000,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['2002.4', '5']],
+        asks: [['2002.5', '5']],
+      },
+    ];
+
+    const baseline = runPhase1Replay(events, {
+      plannedQtyEth: '0.500',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      delaysMs: [0],
+    });
+    const cf = computeCounterfactualFeeImpactOnFixedTrades(baseline.rows, feeSchedule);
+    const vwapCf = cf.find((c) => c.strategy_version === 'vwap_taker_v2')!;
+    // Lower taker fees (0.0004 on both vs 0.0005 BN / 0.00045 HL) yield positive fee savings!
+    expect(Number(vwapCf.fee_delta_usd)).toBeLessThan(0);
+    expect(Number(vwapCf.counterfactual_realized_net_usd)).toBeGreaterThan(Number(vwapCf.baseline_realized_net_usd));
+
+    const vwapRows = baseline.rows.filter((r) => r.strategy_version === 'vwap_taker_v2');
+    const hourly = buildVariantHourlyBreakdown(vwapRows, 900, 3_605_010);
+    expect(hourly).toHaveLength(2);
+    expect(hourly[0]!.entriesTriggered).toBe(1);
+    expect(hourly[0]!.completedInHour).toBe(0);
+    expect(hourly[0]!.openAtHourEnd).toBe(1);
+    expect(hourly[1]!.entriesTriggered).toBe(0);
+    expect(hourly[1]!.completedInHour).toBe(1);
+    expect(hourly[1]!.openAtHourEnd).toBe(0);
   });
 });

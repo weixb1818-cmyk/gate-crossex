@@ -1,10 +1,17 @@
-import { createWriteStream, mkdirSync, writeFileSync } from 'node:fs';
+import { createWriteStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import {
   DEFAULT_REPLAY_CONFIG,
+  DEFAULT_VIP0_FEES,
+  buildVariantHourlyBreakdown,
+  computeCounterfactualFeeImpactOnFixedTrades,
+  resolveFeeScheduleFromSnapshot,
   runPhase1ReplayStream,
+  type CounterfactualFeeRowImpact,
+  type HourlyBreakdownEntry,
   type ReplaySuiteResult,
+  type SanitizedFeeSnapshotInput,
   type TradeScorecardRow,
 } from './replay.js';
 
@@ -173,7 +180,15 @@ function renderFundingLegCsvRows(row: TradeScorecardRow): string[] {
   });
 }
 
-export function renderAuditMarkdownReport(result: ReplaySuiteResult, eventsPath: string): string {
+export function renderAuditMarkdownReport(
+  result: ReplaySuiteResult,
+  eventsPath: string,
+  extras?: {
+    primaryHourlyBreakdown?: HourlyBreakdownEntry[];
+    counterfactualFeeImpact?: CounterfactualFeeRowImpact[];
+    compareFeeLabel?: string;
+  },
+): string {
   const d = result.timelineDiagnostics;
   const firstBridge = d.binanceBridges[0] ?? null;
   const firstHlReconnect = d.hyperliquidReconnectFirstValid[0] ?? null;
@@ -229,6 +244,36 @@ export function renderAuditMarkdownReport(result: ReplaySuiteResult, eventsPath:
     lines.push(
       `| \`${s.age_tier}\` | ${s.entry_bps_threshold} | \`${s.strategy_version}\` | ${s.delay_ms} | ${s.raw_decision_ticks_evaluated} | ${s.raw_candidates} | ${s.logged_candidates} | ${s.triggered_count} | ${s.raw_reject_count} | ${s.completed_roundtrips} | ${s.open_at_end_count} | ${s.in_flight_at_end_count} | ${s.unvalued_open_count} | ${s.realized_roundtrip_pnl_usd} | ${s.mark_to_close_open_pnl_usd} | ${s.total_fees_usd} | ${s.total_funding_net_usd} | ${s.realized_net_bps ?? 'N/A'} |`,
     );
+  }
+
+  if (extras?.primaryHourlyBreakdown && extras.primaryHourlyBreakdown.length > 0) {
+    lines.push(
+      '',
+      '### 3.1 Primary Variant UTC Hourly PnL & Open Carry (`hl_15000ms_bn_15000ms | 2 bps | vwap_taker_v2 | 100 ms`)',
+      '',
+      '| Hour Start (UTC) | Entries | Completed | Open At Hour End | Realized Net (USD) | Fees (USD) | Funding Net (USD) | Open End Mark (USD) |',
+      '|---|---:|---:|---:|---:|---:|---:|---:|',
+    );
+    for (const h of extras.primaryHourlyBreakdown) {
+      lines.push(
+        `| ${h.hourStartIso} | ${h.entriesTriggered} | ${h.completedInHour} | ${h.openAtHourEnd} | ${h.realizedNetUsd} | ${h.feesUsd} | ${h.fundingNetUsd} | ${h.markToCloseOpenEndUsd} |`,
+      );
+    }
+  }
+
+  if (extras?.counterfactualFeeImpact && extras.counterfactualFeeImpact.length > 0) {
+    lines.push(
+      '',
+      `### 3.2 Fixed-Trade Counterfactual Fee Sensitivity (${extras.compareFeeLabel ?? 'compared_fee_snapshot'})`,
+      '',
+      '| Age Tier | Entry (bps) | Strategy | Delay (ms) | Completed | Baseline Net (USD) | Baseline Fees (USD) | Counterfactual Fees (USD) | Fee Delta (USD) | Counterfactual Net (USD) | Counterfactual Net (bps) |',
+      '|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|',
+    );
+    for (const cf of extras.counterfactualFeeImpact) {
+      lines.push(
+        `| \`${cf.age_tier}\` | ${cf.entry_bps_threshold} | \`${cf.strategy_version}\` | ${cf.delay_ms} | ${cf.completed_roundtrips} | ${cf.baseline_realized_net_usd} | ${cf.baseline_fees_usd} | ${cf.counterfactual_fees_usd} | ${cf.fee_delta_usd} | ${cf.counterfactual_realized_net_usd} | ${cf.counterfactual_realized_net_bps ?? 'N/A'} |`,
+      );
+    }
   }
 
   lines.push('', '## 4. End-of-Window In-Flight Orders & Unvalued Positions', '');
@@ -291,6 +336,18 @@ async function main(): Promise<void> {
     DEFAULT_REPLAY_CONFIG.futureSourceToleranceMs,
   );
   const delaysMs = parseNumberList(readArg(args, '--delays-ms'), DEFAULT_REPLAY_CONFIG.delaysMs);
+  const feeSnapshotPath = readArg(args, '--fee-snapshot');
+  const compareFeeSnapshotPath = readArg(args, '--compare-fee-snapshot');
+  const fees = feeSnapshotPath
+    ? resolveFeeScheduleFromSnapshot(
+        JSON.parse(readFileSync(feeSnapshotPath, 'utf8')) as SanitizedFeeSnapshotInput,
+      )
+    : DEFAULT_VIP0_FEES;
+  const compareFees = compareFeeSnapshotPath
+    ? resolveFeeScheduleFromSnapshot(
+        JSON.parse(readFileSync(compareFeeSnapshotPath, 'utf8')) as SanitizedFeeSnapshotInput,
+      )
+    : null;
 
   mkdirSync(outDir, { recursive: true });
   const jsonPath = join(outDir, 'scorecard.json');
@@ -304,6 +361,8 @@ async function main(): Promise<void> {
   fundingLegsStream.write(`${FUNDING_LEGS_CSV_HEADERS.join(',')}\n`);
   let csvRowsWritten = 0;
   let fundingLegRowsWritten = 0;
+  const primaryTriggeredRows: TradeScorecardRow[] = [];
+  const allTriggeredForCounterfactual: TradeScorecardRow[] = [];
 
   const result = await runPhase1ReplayStream(
     inputPath,
@@ -318,6 +377,7 @@ async function main(): Promise<void> {
       hlMaxAgeMsList,
       futureSourceToleranceMs,
       delaysMs,
+      fees,
     },
     {
       retainRowsInMemory: true,
@@ -329,6 +389,17 @@ async function main(): Promise<void> {
           fundingLegRowsWritten += 1;
           fundingLegsStream.write(legLine);
         }
+        if (row.decision === 'TRIGGERED') {
+          if (compareFees) allTriggeredForCounterfactual.push(row);
+          if (
+            row.age_tier === 'hl_15000ms_bn_15000ms'
+            && row.entry_bps_threshold === '2'
+            && row.strategy_version === 'vwap_taker_v2'
+            && row.delay_ms === 100
+          ) {
+            primaryTriggeredRows.push(row);
+          }
+        }
       },
     },
   );
@@ -337,8 +408,24 @@ async function main(): Promise<void> {
   fundingLegsStream.end();
   await Promise.all([once(csvStream, 'finish'), once(fundingLegsStream, 'finish')]);
 
-  writeFileSync(jsonPath, JSON.stringify(result, null, 2));
-  writeFileSync(mdPath, renderAuditMarkdownReport(result, inputPath));
+  const primaryHourlyBreakdown = buildVariantHourlyBreakdown(
+    primaryTriggeredRows,
+    result.timelineDiagnostics.startedAtMs,
+    result.timelineDiagnostics.endedAtMs,
+  );
+  const counterfactualFeeImpact = compareFees
+    ? computeCounterfactualFeeImpactOnFixedTrades(allTriggeredForCounterfactual, compareFees)
+    : undefined;
+
+  writeFileSync(jsonPath, JSON.stringify({
+    ...result,
+    primaryHourlyBreakdown,
+    ...(counterfactualFeeImpact ? { counterfactualFeeImpact } : {}),
+  }, null, 2));
+  writeFileSync(mdPath, renderAuditMarkdownReport(result, inputPath, {
+    primaryHourlyBreakdown,
+    ...(counterfactualFeeImpact ? { counterfactualFeeImpact, compareFeeLabel: compareFees!.note } : {}),
+  }));
 
   console.log(JSON.stringify({
     jsonPath,

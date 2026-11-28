@@ -21,14 +21,201 @@ export type StrategyVersion = 'bbo_v1' | 'vwap_taker_v2';
 export type Direction = 'LONG_BN_SHORT_HL' | 'LONG_HL_SHORT_BN';
 
 export interface FeeScheduleAssumption {
-  source: 'account_api' | 'vip0_fallback';
+  source: 'account_api' | 'manual_snapshot' | 'vip0_fallback';
   binanceContract: string;
   binanceRole: 'TAKER';
   binanceTakerFeeRate: string;
+  binanceMatchedBy?: 'special_fee' | 'venue_future_default' | 'fallback';
   hyperliquidContract: string;
   hyperliquidRole: 'TAKER';
   hyperliquidTakerFeeRate: string;
+  hyperliquidMatchedBy?: 'special_fee' | 'venue_future_default' | 'fallback';
+  fetchedAt?: string | null;
+  effectiveWindowNote?: string | null;
+  isHistoricalRetrospective?: boolean;
   note: string;
+}
+
+export interface SanitizedFeeSnapshotInput {
+  source?: 'account_api' | 'manual_snapshot' | 'vip0_fallback';
+  fetchedAt?: string | null;
+  effectiveWindowNote?: string | null;
+  isHistoricalRetrospective?: boolean;
+  note?: string;
+  fees: Array<{
+    venue?: string;
+    exchange_type?: string;
+    futureMakerFee?: string;
+    future_maker_fee?: string;
+    futureTakerFee?: string;
+    future_taker_fee?: string;
+    specialFees?: Array<{
+      symbol: string;
+      makerFee?: string;
+      takerFee?: string;
+      maker_fee_rate?: string;
+      taker_fee_rate?: string;
+    }>;
+    special_fee_list?: Array<{
+      symbol: string;
+      maker_fee_rate?: string;
+      taker_fee_rate?: string;
+    }>;
+  }>;
+}
+
+export function resolveFeeScheduleFromSnapshot(
+  snapshot: SanitizedFeeSnapshotInput,
+  options: { binanceSymbol?: string; hyperliquidSymbol?: string } = {},
+): FeeScheduleAssumption {
+  const bnSymbol = options.binanceSymbol ?? 'BINANCE_FUTURE_ETH_USDT';
+  const hlSymbol = options.hyperliquidSymbol ?? 'HYPERLIQUID_FUTURE_ETH_USDC';
+
+  const pickVenueRate = (
+    targetVenue: 'BINANCE' | 'HYPERLIQUID',
+    targetSymbol: string,
+  ): { rate: string; matchedBy: 'special_fee' | 'venue_future_default' } => {
+    const entry = snapshot.fees.find(
+      (f) => (f.venue ?? f.exchange_type ?? '').toUpperCase() === targetVenue,
+    );
+    if (!entry) {
+      throw new Error(`Fee snapshot missing entry for venue ${targetVenue}`);
+    }
+    const specials = entry.specialFees ?? entry.special_fee_list ?? [];
+    const specialMatch = specials.find((s) => s.symbol === targetSymbol) as
+      | { symbol: string; takerFee?: string; taker_fee_rate?: string }
+      | undefined;
+    const specialRate = specialMatch?.takerFee ?? specialMatch?.taker_fee_rate;
+    if (specialRate !== undefined && specialRate !== '') {
+      return { rate: specialRate, matchedBy: 'special_fee' };
+    }
+    const venueRate = entry.futureTakerFee ?? entry.future_taker_fee;
+    if (venueRate !== undefined && venueRate !== '') {
+      return { rate: venueRate, matchedBy: 'venue_future_default' };
+    }
+    throw new Error(`Fee snapshot missing taker rate for ${targetVenue} (${targetSymbol})`);
+  };
+
+  const bn = pickVenueRate('BINANCE', bnSymbol);
+  const hl = pickVenueRate('HYPERLIQUID', hlSymbol);
+  const source = snapshot.source ?? 'account_api';
+  const retrospectiveLabel = snapshot.isHistoricalRetrospective ? 'retrospective_scenario_recalculation' : 'window_matched';
+  return {
+    source,
+    binanceContract: `${bnSymbol} (ETHUSDT)`,
+    binanceRole: 'TAKER',
+    binanceTakerFeeRate: bn.rate,
+    binanceMatchedBy: bn.matchedBy,
+    hyperliquidContract: `${hlSymbol} (ETH)`,
+    hyperliquidRole: 'TAKER',
+    hyperliquidTakerFeeRate: hl.rate,
+    hyperliquidMatchedBy: hl.matchedBy,
+    fetchedAt: snapshot.fetchedAt ?? null,
+    effectiveWindowNote: snapshot.effectiveWindowNote ?? null,
+    isHistoricalRetrospective: snapshot.isHistoricalRetrospective ?? false,
+    note: snapshot.note
+      ?? `${source} (${retrospectiveLabel}): BN ${bn.matchedBy}=${bn.rate}, HL ${hl.matchedBy}=${hl.rate}, fetchedAt=${snapshot.fetchedAt ?? 'unspecified'}`,
+  };
+}
+
+export interface CounterfactualFeeRowImpact {
+  age_tier: string;
+  entry_bps_threshold: string;
+  strategy_version: StrategyVersion;
+  delay_ms: number;
+  completed_roundtrips: number;
+  baseline_realized_net_usd: string;
+  baseline_fees_usd: string;
+  counterfactual_fees_usd: string;
+  fee_delta_usd: string;
+  counterfactual_realized_net_usd: string;
+  counterfactual_realized_net_bps: string | null;
+}
+
+/**
+ * Recompute fees and net PnL over a fixed set of completed baseline trades without re-filtering
+ * entry selection, isolating pure fee-schedule impact from trade-set shift.
+ */
+export function computeCounterfactualFeeImpactOnFixedTrades(
+  rows: readonly TradeScorecardRow[],
+  newFees: FeeScheduleAssumption,
+): CounterfactualFeeRowImpact[] {
+  const byVariant = new Map<string, {
+    spec: { age_tier: string; entry_bps_threshold: string; strategy_version: StrategyVersion; delay_ms: number };
+    completed: number;
+    baseNet: Decimal;
+    baseFees: Decimal;
+    cfFees: Decimal;
+    notional: Decimal;
+  }>();
+
+  const legFeeUsdt = (fill: LegFillDetail, rate: string): Decimal => {
+    const qty = new Decimal(fill.qtyEth);
+    const feeNative = qty.mul(fill.avgPriceNative).mul(rate).toDecimalPlaces(8);
+    return fill.venue === 'BINANCE'
+      ? feeNative
+      : feeNative.mul(fill.fxAtExec).toDecimalPlaces(8);
+  };
+
+  for (const row of rows) {
+    if (
+      row.decision !== 'TRIGGERED'
+      || row.is_open_at_end
+      || !row.entry_long_fill
+      || !row.entry_short_fill
+      || !row.exit_long_fill
+      || !row.exit_short_fill
+    ) {
+      continue;
+    }
+    const key = `${row.age_tier}|${row.entry_bps_threshold}|${row.strategy_version}|${row.delay_ms}`;
+    let acc = byVariant.get(key);
+    if (!acc) {
+      acc = {
+        spec: {
+          age_tier: row.age_tier,
+          entry_bps_threshold: row.entry_bps_threshold,
+          strategy_version: row.strategy_version,
+          delay_ms: row.delay_ms,
+        },
+        completed: 0,
+        baseNet: new Decimal(0),
+        baseFees: new Decimal(0),
+        cfFees: new Decimal(0),
+        notional: new Decimal(0),
+      };
+      byVariant.set(key, acc);
+    }
+    acc.completed += 1;
+    acc.baseNet = acc.baseNet.plus(row.roundtrip_net_pnl_usd ?? '0');
+    acc.baseFees = acc.baseFees.plus(row.fees_4leg_usd ?? '0');
+    acc.notional = acc.notional.plus(row.planned_notional_usdt ?? '0');
+
+    const fills = [row.entry_long_fill, row.entry_short_fill, row.exit_long_fill, row.exit_short_fill];
+    let tradeCfFee = new Decimal(0);
+    for (const fill of fills) {
+      const rate = fill.venue === 'BINANCE' ? newFees.binanceTakerFeeRate : newFees.hyperliquidTakerFeeRate;
+      tradeCfFee = tradeCfFee.plus(legFeeUsdt(fill, rate));
+    }
+    acc.cfFees = acc.cfFees.plus(tradeCfFee);
+  }
+
+  return [...byVariant.values()].map((acc) => {
+    const feeDelta = acc.cfFees.minus(acc.baseFees);
+    const cfNet = acc.baseNet.minus(feeDelta);
+    return {
+      ...acc.spec,
+      completed_roundtrips: acc.completed,
+      baseline_realized_net_usd: acc.baseNet.toDecimalPlaces(6).toString(),
+      baseline_fees_usd: acc.baseFees.toDecimalPlaces(6).toString(),
+      counterfactual_fees_usd: acc.cfFees.toDecimalPlaces(6).toString(),
+      fee_delta_usd: feeDelta.toDecimalPlaces(6).toString(),
+      counterfactual_realized_net_usd: cfNet.toDecimalPlaces(6).toString(),
+      counterfactual_realized_net_bps: acc.notional.gt(0)
+        ? cfNet.div(acc.notional).mul(10_000).toDecimalPlaces(4).toString()
+        : null,
+    };
+  });
 }
 
 export const DEFAULT_VIP0_FEES: FeeScheduleAssumption = {
@@ -36,11 +223,90 @@ export const DEFAULT_VIP0_FEES: FeeScheduleAssumption = {
   binanceContract: 'BINANCE_FUTURE_ETH_USDT (ETHUSDT)',
   binanceRole: 'TAKER',
   binanceTakerFeeRate: '0.0005',
+  binanceMatchedBy: 'fallback',
   hyperliquidContract: 'HYPERLIQUID_FUTURE_ETH_USDC (ETH)',
   hyperliquidRole: 'TAKER',
   hyperliquidTakerFeeRate: '0.00045',
+  hyperliquidMatchedBy: 'fallback',
+  fetchedAt: null,
+  effectiveWindowNote: null,
+  isHistoricalRetrospective: false,
   note: 'Native venue fallback fees (not CrossEx account-tier rates): Binance USD-M VIP0 Taker (5 bps) and Hyperliquid Tier-0 Taker (4.5 bps)',
 };
+
+export interface HourlyBreakdownEntry {
+  hourStartIso: string;
+  hourEndIso: string;
+  entriesTriggered: number;
+  completedInHour: number;
+  openAtHourEnd: number;
+  realizedNetUsd: string;
+  feesUsd: string;
+  fundingNetUsd: string;
+  markToCloseOpenEndUsd: string;
+}
+
+export function buildVariantHourlyBreakdown(
+  rows: readonly TradeScorecardRow[],
+  startedAtMs: number,
+  endedAtMs: number,
+): HourlyBreakdownEntry[] {
+  if (endedAtMs <= startedAtMs) return [];
+  const firstHourStart = Math.floor(startedAtMs / 3_600_000) * 3_600_000;
+  const triggered = rows.filter((r) => r.decision === 'TRIGGERED');
+  const buckets: HourlyBreakdownEntry[] = [];
+
+  for (let hStart = firstHourStart; hStart <= endedAtMs; hStart += 3_600_000) {
+    const hEnd = hStart + 3_600_000;
+    const isFinalBucket = hEnd > endedAtMs;
+    let entriesTriggered = 0;
+    let completedInHour = 0;
+    let openAtHourEnd = 0;
+    let realized = new Decimal(0);
+    let fees = new Decimal(0);
+    let funding = new Decimal(0);
+    let markOpen = new Decimal(0);
+
+    for (const r of triggered) {
+      const entryTs = r.exec_arrival_ts ?? r.trigger_ts;
+      if (entryTs >= hStart && entryTs < hEnd) {
+        entriesTriggered += 1;
+      }
+      if (!r.is_open_at_end && r.exit_exec_arrival_ts !== null) {
+        if (r.exit_exec_arrival_ts >= hStart && r.exit_exec_arrival_ts < hEnd) {
+          completedInHour += 1;
+          realized = realized.plus(r.roundtrip_net_pnl_usd ?? '0');
+          fees = fees.plus(r.fees_4leg_usd ?? '0');
+          funding = funding.plus(r.funding_net_usd ?? '0');
+        }
+      }
+      const openBoundary = Math.min(hEnd - 1, endedAtMs);
+      const stillOpenAtEndOfHour = entryTs <= openBoundary
+        && (r.is_open_at_end || (r.exit_exec_arrival_ts !== null && r.exit_exec_arrival_ts >= hEnd));
+      if (stillOpenAtEndOfHour) {
+        openAtHourEnd += 1;
+        if (isFinalBucket && r.is_open_at_end && r.mark_to_close_usd) {
+          markOpen = markOpen.plus(r.mark_to_close_usd);
+          fees = fees.plus(r.fees_4leg_usd ?? '0');
+          funding = funding.plus(r.funding_net_usd ?? '0');
+        }
+      }
+    }
+
+    buckets.push({
+      hourStartIso: new Date(hStart).toISOString(),
+      hourEndIso: new Date(Math.min(hEnd, endedAtMs)).toISOString(),
+      entriesTriggered,
+      completedInHour,
+      openAtHourEnd,
+      realizedNetUsd: realized.toDecimalPlaces(6).toString(),
+      feesUsd: fees.toDecimalPlaces(6).toString(),
+      fundingNetUsd: funding.toDecimalPlaces(6).toString(),
+      markToCloseOpenEndUsd: isFinalBucket ? markOpen.toDecimalPlaces(6).toString() : '0',
+    });
+  }
+  return buckets;
+}
 
 export interface LegAgeConfig {
   maxRecvAgeMs: number;
@@ -210,7 +476,7 @@ export interface TradeScorecardRow {
   denominator_rule: string;
   fx_usdc_usdt: string;
   fx_source: string;
-  fee_source: 'account_api' | 'vip0_fallback';
+  fee_source: 'account_api' | 'manual_snapshot' | 'vip0_fallback';
   fee_assumption_detail: string;
   exit_assumption: string;
   bbo_entry_spread_bps: string | null;
@@ -1119,6 +1385,11 @@ export class StreamingReplayRunner {
           ]),
         );
         const deferredTriggeredRows = (v.deferredTriggeredRows ?? []).map((entry) => {
+          if (typeof entry !== 'object' || entry === null || !('row' in entry)) {
+            throw new Error(
+              `Incompatible legacy ReplayCheckpoint format for variant ${v.spec.ageTierLabel}|${v.spec.entryBps}|${v.spec.version}|${v.spec.delayMs}ms: deferredTriggeredRows is missing exit midpoint fallback fields; please replay from the raw events.ndjson source.`,
+            );
+          }
           const linked = rowById.get(entry.row.opportunity_id)
             ?? sampleByKey.get(
               `${entry.row.age_tier}|${entry.row.entry_bps_threshold}|${entry.row.strategy_version}|${entry.row.delay_ms}|${entry.row.opportunity_id}`,
