@@ -567,3 +567,25 @@ npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay 
 
 * **修复内容**：`executePendingOrder` 平仓时刻将 `midpointFromView(bnCheck.view)`、`midpointFromView(hlCheck.view)`、`fxRate` 与 `fxSource` 一并存入待核账记录（`DeferredFundingRowEntry`），跨断点持久化还原；`reconcileRowFunding` 期末对账不再使用 `exit_long_fill.avgPriceNative` 替代中间价。
 * **回归证明**（[phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts#L1708-L1844)）：构造 `markPrice: null`、平仓盘口 `99.95 / 100.00` 的 1 ETH 样本，在早到（`1080`）与迟到（`1220`）两种输入下，文件回放与直接流式回放（`retainRowsInMemory: false`）均一致按 `99.975`（`book_mid_fallback`）计提 `-0.099975 USDT`，全部后端 `17` 个测试文件 **`243/243` 通过**（含一期 `19/19`）、`tsc --noEmit` 与 `eslint` 零报错通过。
+
+## 二十、开发团队对下一步工作的待确认问题（2026-11-28）
+
+第一期 `ETH` 9 小时正式回放及全部回归（第 18、19 节）完成后，为确保第 18.2 节提及的**真实账户费率重算**、**下一段样本外验证**以及后续 **Phase 2 执行层接入**方向明确不返工，开发团队梳理出以下待与审计及业务方确认的问题：
+
+### 20.1 真实账户费率核对与费率敏感度应对
+
+1. **真实费率获取方式**：后端已具备通过 CrossEx `queryFeeRates` 接口结合凭证库拉取账户实际合同费率及 `specialFees` 列表的能力（[app.ts](../apps/backend/src/app.ts#L2143-L2195)），但当前采集主机未配置只读 API 凭证，故首期回放采用原生 VIP0/Tier-0 回退假设（Binance `0.0005` / Hyperliquid `0.00045`）。请问下一步是：**直接配置只读 API Key 自动拉取 CrossEx 统一账户针对 `BINANCE_FUTURE_ETH_USDT` 与 `HYPERLIQUID_FUTURE_ETH_USDC` 的实际费率**，还是**先按人工确认的账户 VIP/机构费率静态输入重算**？
+2. **双 Taker vs Maker+Taker 边界**：第 18.2 节测算指出，在 `15s / 2bps / 100ms` 窗口中仅当单腿费率增量高于回退假设 `0.379 bps` 时净收益即降为零；如真实账户双 Taker 费率高于 VIP0 回退值并压缩正收益空间，下一步是**先在样本外继续观察双 Taker**，还是**并行在回放与 Phase 2 优先检验一腿挂单 Maker + 对冲保护价 IOC Taker 模式**？
+3. **重算对照交付口径**：若真实费率进入 `vwap_taker_v2` 的开仓准入门槛并改变触发成交集合，下一轮报告是否要求同时并列输出**原 VIP0 回退费率**与**真实账户费率**两套结果以便连续比较？
+
+### 20.2 下一段样本外验证窗口参数范围
+
+1. **录制时长**：建议的下一段样本外实盘录盘计划持续多久？（仍保持 **9 小时以上**覆盖单次 Binance 8 小时结算，还是拉长至 **24 小时**覆盖全部 3 个 Binance 8 小时结算时段与日夜流动周期？）
+2. **标的与场所覆盖**：下一段样本外是否仍**只录 `ETH`（`BINANCE + HYPERLIQUID`）**先验证样本稳定性，还是在同一采集进程中同步增加第 4.2 节预备标的 **`SOL`** 或对照场所 **`GATE`** 合约？
+3. **正式回放入口固定**：第 18.2 节已指出直接内存运行器未预载索引时闭环缓冲内存随交易数增长；请确认后续所有长时样本外正式报告**统一以 CLI 流式预扫描入口（`phase1:replay`）作为唯一正式交付口径**。
+
+### 20.3 Phase 2（执行接入与少人值守固定对）前置澄清
+
+1. **行情信号源与下单执行路由拆分**：一期已实测 CrossEx 公共 WS 在 Binance 缺少初始快照与 `pu`、在 Hyperliquid 存在 ~12 秒推送滞后（第六节）。Phase 2 实盘中，是否明确**用交易所官方直连盘口驱动策略决策与风控保护，同时经 CrossEx 统一账户 API 发单执行**？若是，CrossEx 网关发单、撤单、成交回报及 REST 限流排队延迟将取代离线的 `100 ms` 敏感性假设——进入 Phase 2 前是否需要先做极小额真单/只读排队实测来测定实际发单 RTT 与各所 `LIMIT+IOC` / `MARKET+IOC` / `reduce_only` 语义？
+2. **实盘资金额度与账户模式参数**：在进入多策略/固定对 Phase 2 试运行前，需业务与审计确认实际 CrossEx 账户模式下的关键风控阈值：**真实可用本金与单对预算配额**、**目标名义杠杆上限**（沿用估算的 `5x` 或下调至更保守值）、**单腿裸腿最大允许时长与强制降险阈值**，以及 **USDT/USDC 多币种担保折算与借款利率观测基线**（对齐第一.3、一.5 节与 CrossEx 实际账户规则）。
+3. **二期启动准入顺序**：请确认执行节奏是**先完成样本外录盘与真实费率重算并经审计复核后再启动 Phase 2 实盘极小额测试**，还是**在样本外录盘的同时并行开展 Phase 2 订单语义探测、账户费率接入与保证金预留联调**？
