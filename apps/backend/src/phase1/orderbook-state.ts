@@ -353,6 +353,10 @@ export interface BinanceBookCheckpoint {
   lastSourceTs: number;
   lastRecvTs: number;
   droppedOverflowCount: number;
+  droppedSincePending?: number;
+  archivedCrossFormatMutations?: number;
+  buffer?: BinanceDepthDeltaEvent[];
+  pendingSnapshot?: BinanceDepthSnapshotInput | null;
   bids: PriceLevel[];
   asks: PriceLevel[];
 }
@@ -409,6 +413,8 @@ export class BinanceOrderBookStateMachine {
   }
 
   exportCheckpoint(): BinanceBookCheckpoint {
+    const cloneLevels = (lvls: readonly PriceLevel[]): PriceLevel[] =>
+      lvls.map((lvl) => [lvl[0], lvl[1]] as const);
     return {
       status: this.status,
       connGen: this.connGen,
@@ -417,12 +423,35 @@ export class BinanceOrderBookStateMachine {
       lastSourceTs: this.lastSourceTs,
       lastRecvTs: this.lastRecvTs,
       droppedOverflowCount: this.droppedOverflowCount,
+      droppedSincePending: this.droppedSincePending,
+      archivedCrossFormatMutations: this.getCrossFormatMutationCount(),
+      buffer: this.buffer.map((ev) => ({
+        ...ev,
+        U: typeof ev.U === 'bigint' ? ev.U.toString() : ev.U,
+        u: typeof ev.u === 'bigint' ? ev.u.toString() : ev.u,
+        pu: typeof ev.pu === 'bigint' ? ev.pu.toString() : ev.pu,
+        bids: cloneLevels(ev.bids),
+        asks: cloneLevels(ev.asks),
+      })),
+      pendingSnapshot: this.pendingSnapshot
+        ? {
+            connGen: this.pendingSnapshot.connGen,
+            fetchedAtMs: this.pendingSnapshot.fetchedAtMs,
+            lastUpdateId: typeof this.pendingSnapshot.lastUpdateId === 'bigint'
+              ? this.pendingSnapshot.lastUpdateId.toString()
+              : this.pendingSnapshot.lastUpdateId,
+            bids: cloneLevels(this.pendingSnapshot.bids),
+            asks: cloneLevels(this.pendingSnapshot.asks),
+          }
+        : null,
       bids: this.status === 'SYNCED' ? this.bids.toPriceLevels() : [],
       asks: this.status === 'SYNCED' ? this.asks.toPriceLevels() : [],
     };
   }
 
   restoreCheckpoint(cp: BinanceBookCheckpoint): void {
+    const cloneLevels = (lvls: readonly PriceLevel[]): PriceLevel[] =>
+      lvls.map((lvl) => [lvl[0], lvl[1]] as const);
     this.status = cp.status;
     this.connGen = cp.connGen;
     this.hasOpened = cp.hasOpened ?? (cp.connGen > 0 || cp.status !== 'UNSYNCED');
@@ -430,11 +459,29 @@ export class BinanceOrderBookStateMachine {
     this.lastSourceTs = cp.lastSourceTs;
     this.lastRecvTs = cp.lastRecvTs;
     this.droppedOverflowCount = cp.droppedOverflowCount;
-    this.buffer = [];
-    this.pendingSnapshot = null;
-    this.droppedSincePending = 0;
-    this.bids.loadSnapshot(cp.bids);
-    this.asks.loadSnapshot(cp.asks);
+    this.droppedSincePending = cp.droppedSincePending ?? 0;
+    this.archivedCrossFormatMutations = cp.archivedCrossFormatMutations ?? 0;
+    this.buffer = (cp.buffer ?? []).map((ev) => ({
+      ...ev,
+      bids: cloneLevels(ev.bids),
+      asks: cloneLevels(ev.asks),
+    }));
+    this.pendingSnapshot = cp.pendingSnapshot
+      ? {
+          connGen: cp.pendingSnapshot.connGen,
+          fetchedAtMs: cp.pendingSnapshot.fetchedAtMs,
+          lastUpdateId: cp.pendingSnapshot.lastUpdateId,
+          bids: cloneLevels(cp.pendingSnapshot.bids),
+          asks: cloneLevels(cp.pendingSnapshot.asks),
+        }
+      : null;
+    if (cp.status === 'SYNCED') {
+      this.bids.loadSnapshot(cp.bids);
+      this.asks.loadSnapshot(cp.asks);
+    } else {
+      this.bids.clear();
+      this.asks.clear();
+    }
   }
 
   private pushBufferedDelta(event: BinanceDepthDeltaEvent): boolean {

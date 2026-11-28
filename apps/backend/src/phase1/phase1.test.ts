@@ -1432,3 +1432,281 @@ describe('Phase 1 Section 14.2 audit regressions', () => {
     expect(res.timelineDiagnostics.crossFormatPriceUpdates.binance).toBe(1);
   });
 });
+
+describe('Phase 1 Section 16.2 streaming & mid-bridge checkpoint regressions', () => {
+  it('reconciles late funding consistently across callback & summary in direct StreamingReplayRunner with retainRowsInMemory=false and finite maxRetainedRows', () => {
+    const buildLateFundingEvents = (): RecordedMarketEvent[] => [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['99.9', '5']],
+        asks: [['100.0', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['99.9', '5']],
+        asks: [['100.0', '5']],
+      },
+      // Open Long BN @ 100.0, Short HL @ 101.0 at t=1030 (1 ETH).
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1030,
+        sourceTs: 1025,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['101.0', '5']],
+        asks: [['101.1', '5']],
+      },
+      // Close at t=1150.
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 7,
+        recvTs: 1140,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1138,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [['100.0', '5'], ['99.9', '0']],
+        asks: [['100.1', '5'], ['100.0', '0']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 8,
+        recvTs: 1150,
+        sourceTs: 1148,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['99.9', '5']],
+        asks: [['100.0', '5']],
+      },
+      // Late settlement arriving AFTER trade closed (recvTs=1220 > exit=1150).
+      {
+        type: 'funding_settled',
+        venue: 'BINANCE',
+        recvSeq: 9,
+        recvTs: 1220,
+        source: 'bn_funding_rate_api',
+        symbol: 'ETHUSDT',
+        settlementTime: 1050,
+        isHistoricalBackfill: false,
+        fundingRate: '0.001',
+        markPrice: '100',
+        premium: null,
+        nearestOraclePriceUsdc: null,
+        nearestOraclePriceTs: null,
+        nearestFxUsdcUsdt: null,
+        nearestFxTs: null,
+        nearestFxSource: null,
+      },
+    ];
+
+    const cfg = {
+      plannedQtyEth: '1',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      delaysMs: [0],
+      cooldownBetweenRejectsMs: 0,
+    };
+
+    const events = buildLateFundingEvents();
+    const earlyEvents = events.map((ev) => (ev.type === 'funding_settled' ? { ...ev, recvTs: 1080 } : ev));
+    const earlyReference = runPhase1Replay(earlyEvents, cfg);
+    const expectedNet = earlyReference.rows.find((r) => r.decision === 'TRIGGERED')!.roundtrip_net_pnl_usd!;
+    expect(expectedNet).toBe('0.70955');
+
+    // Mode 1: Direct StreamingReplayRunner with retainRowsInMemory: false & NO preloadedFundingSettlements.
+    const unretainedStreamed: ReturnType<typeof runPhase1Replay>['rows'] = [];
+    const runnerNoRetain = new StreamingReplayRunner(cfg, undefined, {
+      retainRowsInMemory: false,
+      onFinalizedRow: (row) => unretainedStreamed.push(row),
+    });
+    for (const ev of events) runnerNoRetain.processEvent(ev);
+    const resNoRetain = runnerNoRetain.finalize();
+
+    expect(resNoRetain.rows).toHaveLength(0);
+    expect(unretainedStreamed.filter((r) => r.decision === 'TRIGGERED')).toHaveLength(2);
+    for (const r of unretainedStreamed.filter((row) => row.decision === 'TRIGGERED')) {
+      expect(r.funding_events_crossed).toBe(1);
+      expect(r.funding_net_usd).toBe('-0.1');
+      expect(r.roundtrip_net_pnl_usd).toBe(expectedNet);
+    }
+    for (const s of resNoRetain.summaries) {
+      expect(s.total_funding_net_usd).toBe('-0.1');
+      expect(s.realized_roundtrip_pnl_usd).toBe(expectedNet);
+    }
+
+    // Mode 2: Finite maxRetainedRows=1 & NO preloadedFundingSettlements.
+    const cappedStreamed: ReturnType<typeof runPhase1Replay>['rows'] = [];
+    const runnerCapped = new StreamingReplayRunner(cfg, undefined, {
+      retainRowsInMemory: true,
+      maxRetainedRows: 1,
+      onFinalizedRow: (row) => cappedStreamed.push(row),
+    });
+    for (const ev of events) runnerCapped.processEvent(ev);
+    const resCapped = runnerCapped.finalize();
+
+    expect(cappedStreamed.filter((r) => r.decision === 'TRIGGERED')).toHaveLength(2);
+    for (const r of cappedStreamed.filter((row) => row.decision === 'TRIGGERED')) {
+      expect(r.funding_events_crossed).toBe(1);
+      expect(r.funding_net_usd).toBe('-0.1');
+      expect(r.roundtrip_net_pnl_usd).toBe(expectedNet);
+    }
+    for (const s of resCapped.summaries) {
+      expect(s.total_funding_net_usd).toBe('-0.1');
+      expect(s.realized_roundtrip_pnl_usd).toBe(expectedNet);
+    }
+
+    // Mode 3: Segmented direct runner split BEFORE late funding event.
+    const streamedSeg: ReturnType<typeof runPhase1Replay>['rows'] = [];
+    const seg1 = new StreamingReplayRunner(cfg, undefined, { retainRowsInMemory: false });
+    for (const ev of events.slice(0, events.length - 1)) seg1.processEvent(ev);
+    const cp = JSON.parse(JSON.stringify(seg1.exportCheckpoint()));
+    const seg2 = StreamingReplayRunner.fromCheckpoint(cp, {
+      retainRowsInMemory: false,
+      onFinalizedRow: (row) => streamedSeg.push(row),
+    });
+    seg2.processEvent(events[events.length - 1]!);
+    const resSeg = seg2.finalize();
+    expect(streamedSeg.filter((r) => r.decision === 'TRIGGERED')).toHaveLength(2);
+    for (const r of streamedSeg.filter((row) => row.decision === 'TRIGGERED')) {
+      expect(r.funding_net_usd).toBe('-0.1');
+      expect(r.roundtrip_net_pnl_usd).toBe(expectedNet);
+    }
+    expect(resSeg.summaries).toEqual(resNoRetain.summaries);
+  });
+
+  it('preserves mid-bridge Binance buffer and pendingSnapshot across checkpoint split (both delta-first and snapshot-first)', () => {
+    const cfg = {
+      plannedQtyEth: '0.500',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      delaysMs: [0],
+      cooldownBetweenRejectsMs: 0,
+    };
+
+    const tailEvents: RecordedMarketEvent[] = [
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1030,
+        sourceTs: 1025,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1706.0', '5']],
+        asks: [['1706.2', '5']],
+      },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 7,
+        recvTs: 1300,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1295,
+        U: '111',
+        u: '112',
+        pu: '110',
+        bids: [['1703.0', '5'], ['1699.9', '0']],
+        asks: [['1703.1', '5'], ['1700.0', '0']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 8,
+        recvTs: 1300,
+        sourceTs: 1298,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['1702.9', '5']],
+        asks: [['1703.0', '5']],
+      },
+    ];
+
+    const bnDeltaBridge: RecordedMarketEvent = {
+      type: 'bn_depth_delta',
+      connGen: 1,
+      recvSeq: 4,
+      recvTs: 1010,
+      stream: 'ethusdt@depth@100ms',
+      eventTime: 1005,
+      U: '100',
+      u: '110',
+      pu: '99',
+      bids: [['1699.9', '5']],
+      asks: [['1700.0', '5']],
+    };
+    const bnSnapBridge: RecordedMarketEvent = {
+      type: 'bn_depth_snapshot',
+      connGen: 1,
+      recvSeq: 5,
+      recvTs: 1020,
+      lastUpdateId: '105',
+      bids: [['1699.9', '5']],
+      asks: [['1700.0', '5']],
+    };
+    const setupPrefix: RecordedMarketEvent[] = [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+    ];
+
+    const normalizeRows = (rows: ReturnType<typeof runPhase1Replay>['rows']) =>
+      rows.map((r) => ({ ...r, run_id: 'normalized' }));
+
+    for (const [label, midSequence] of [
+      ['delta-before-snapshot', [bnDeltaBridge, bnSnapBridge]],
+      ['snapshot-before-delta', [{ ...bnSnapBridge, recvSeq: 4, recvTs: 1010 }, { ...bnDeltaBridge, recvSeq: 5, recvTs: 1020 }]],
+    ] as const) {
+      const fullEvents: RecordedMarketEvent[] = [...setupPrefix, ...midSequence, ...tailEvents];
+      const fullRunner = new StreamingReplayRunner(cfg);
+      for (const ev of fullEvents) fullRunner.processEvent(ev);
+      const fullRes = fullRunner.finalize();
+
+      // Cut right after the first bridging event (index 3 -> waiting inside BUFFERING state!).
+      const cutAt = 4;
+      const seg1 = new StreamingReplayRunner(cfg);
+      for (const ev of fullEvents.slice(0, cutAt)) seg1.processEvent(ev);
+      const cp = JSON.parse(JSON.stringify(seg1.exportCheckpoint()));
+      const seg2 = StreamingReplayRunner.fromCheckpoint(cp);
+      for (const ev of fullEvents.slice(cutAt)) seg2.processEvent(ev);
+      const segRes = seg2.finalize();
+
+      expect(fullRes.timelineDiagnostics.binanceBridges, label).toHaveLength(1);
+      expect(segRes.timelineDiagnostics.binanceBridges, label).toHaveLength(1);
+      expect(segRes.timelineDiagnostics.binanceBridges, label).toEqual(fullRes.timelineDiagnostics.binanceBridges);
+      expect(segRes.timelineDiagnostics.coverageByAgeTier[0]!.valid_overlap_ms, label).toBe(270);
+      expect(segRes.timelineDiagnostics.coverageByAgeTier, label).toEqual(fullRes.timelineDiagnostics.coverageByAgeTier);
+      expect(segRes.summaries, label).toEqual(fullRes.summaries);
+      expect(normalizeRows(segRes.rows), label).toEqual(normalizeRows(fullRes.rows));
+      for (const s of segRes.summaries) {
+        expect(s.triggered_count, label).toBe(1);
+        expect(s.completed_roundtrips, label).toBe(1);
+      }
+    }
+  });
+});

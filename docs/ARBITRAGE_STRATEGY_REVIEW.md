@@ -501,3 +501,41 @@
 2. **Binance 正在建立盘口时保存断点，续跑会丢失桥接所需输入。** 分别在“已收到首个增量、尚待 REST 快照”和“快照已到、尚待首个增量”两个时点保存并恢复。两组输入连续运行都成功桥接一次，双腿有效 270 ms、两版各触发一笔。相同输入切段后均为零桥接、零重合、零成交。断点只写出已同步盘口，恢复时清空缓冲增量及待桥接快照。请保存桥接中间状态，或只在可恢复的边界发布断点并从该位置续读。验收时逐项比较桥接、覆盖、成交与损益。[Binance 断点保存与恢复](../apps/backend/src/phase1/orderbook-state.ts#L411)
 
 **下一次交付**可用上述两个小样本完成代码回归，同时提供原始 NDJSON 的只读下载位置或共享挂载。评审方可用第 15.4 节的 SHA-256 校验后，从同一原始输入独立重放。回归及独立重放通过后关闭第 9.3 节的剩余验收。团队可并行按现有参数开展下一段样本外验证，单独报告该窗口的净收益与期末持仓。
+
+## 十七、第 16.2 节流式边界修正、全量回归与原始 NDJSON 只读下载交付（2026-11-28）
+
+### 17.1 第 16.2 节两项边界修正与回归校验
+
+1. **直接调用 `StreamingReplayRunner`（未预载结算索引）的迟到资金费回调与汇总一致性**（[replay.ts](../apps/backend/src/phase1/replay.ts)）
+   - 当省略 `preloadedFundingSettlements` 时，已闭环 `TRIGGERED` 记录（`variant.deferredTriggeredRows`）不在平仓瞬间提前触发 `onFinalizedRow`；而是独立保留引用直至 `finalize()`（包含跨断点的 `exportCheckpoint` / `fromCheckpoint` 续跑），在全部结算记录接收完毕后统一执行 `reconcileRowFunding` 更新资金费、净盈亏及 `variant.metrics`，同步对齐 `variant.rows` 与 `delaySampleRows`，随后再触发 `onFinalizedRow`。
+   - **效果**：即使设置 `retainRowsInMemory: false` 或有限采样上限 `maxRetainedRows: 1`（或分段断点续跑），`onFinalizedRow` 流式写出的记录与 `finalize()` 输出的 `summaries` 均完整包含迟到资金费且完全一致（在 1 ETH 回归测试输入中，平仓净利由漏记前 `+0.80955` 统一对齐为 `-0.1` 扣费后的 `+0.70955 USDT`，与早到对照组完全相同）。
+   - 当使用 `runPhase1Replay`、`runPhase1ReplayStream` 或 CLI 时，因前置扫描已持有完整 `preloadedFundingSettlements`，闭环成交仍可在流式运行期零延迟实时写出，内存占保持 `O(1)`。
+2. **Binance 盘口桥接中段断点的完整状态持久化**（[orderbook-state.ts](../apps/backend/src/phase1/orderbook-state.ts)）
+   - `BinanceOrderBookStateMachine.exportCheckpoint()` 与 `restoreCheckpoint()` 现完整序列化并恢复 `BUFFERING` 阶段中的 `buffer`（已收增量列表）、`pendingSnapshot`（待桥接 REST 快照）、`droppedSincePending` 与 `archivedCrossFormatMutations`。
+   - **效果**：无论在“已收到首个增量、尚待 REST 快照”还是“快照已到、尚待首个增量”处切段导出断点并恢复，续跑均可正确完成桥接，桥接次数（`1`）、双腿有效重合（`270 ms`）、两版策略触发次数（各 `1`）及成交损益与整段连续运行逐比特一致。
+3. **测试与基准验证**（[phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts#L1423-L1695)）
+   - 新增第 16.2 节两项专项回归；完整运行 `npm --workspace apps/backend exec -- tsc --noEmit`、`npx eslint`、`npm run build -w apps/backend` 与 `npm --workspace apps/backend test`（17 个测试文件、**242/242** 全部通过，含一期 `18/18`）。
+   - 重跑 100,001 事件 / 1,000 档流式基准校验（`node apps/backend/dist/phase1/benchmark-replay.js --events 100000 --levels 1000`）：耗时 `7.22 s`（`13,856 events/s`）、峰值堆内存 `31.85 MB`、`rowsStreamedCount = 23,958`、`rowsRetainedInRamCount = 0`、`segmentedCheckpointParityExact = true`。
+
+### 17.2 原始 9 小时录盘 `events.ndjson` 只读下载地址与核验命令
+
+为便于评审环境直接获取原始 `events.ndjson`（2,622,792 行、2,630,789,890 字节）并完成独立全链路重放，已将其 gzip 压缩上传至本仓库只读 GitHub Release（[`phase1-9h-raw-20261127`](https://github.com/weixb1818-cmyk/gate-crossex/releases/tag/phase1-9h-raw-20261127)），上传前已本地校验 `gzip -dc` 解压字节流 SHA-256 与原始文件完全一致：
+
+| 资产 | 下载链接 | 大小 | SHA-256 |
+|---|---|---:|---|
+| `events.ndjson.gz`（压缩原始录盘） | https://github.com/weixb1818-cmyk/gate-crossex/releases/download/phase1-9h-raw-20261127/events.ndjson.gz | 354,402,942 B (338 MB) | `0efc17dfe5d14039457b22fb606eb12e74aa87d05c097c0cec4791a2e401d73c` |
+| 解压后 `events.ndjson` | `gzip -dc events.ndjson.gz > events.ndjson` | 2,630,789,890 B (2.5 GB) | `cb2abec6e39c0acc6f180c5c0ab111a3ab8a3f8c4928427c6b03fc23f5002ca1` |
+| `manifest.json` | https://github.com/weixb1818-cmyk/gate-crossex/releases/download/phase1-9h-raw-20261127/manifest.json | 2,314 B | `e0632de0571811101720dc284226226f58324cbd972ee38fb9850d0d4461a9a4` |
+| `SHA256SUMS.txt` | https://github.com/weixb1818-cmyk/gate-crossex/releases/download/phase1-9h-raw-20261127/SHA256SUMS.txt | 1,451 B | `2704a315787920bf62c39e0ca645decc4c6b83b4c3df2ea6504b34156129b6f6` |
+
+评审方独立校验与全链路重放示例：
+```bash
+curl -L -o events.ndjson.gz https://github.com/weixb1818-cmyk/gate-crossex/releases/download/phase1-9h-raw-20261127/events.ndjson.gz
+sha256sum events.ndjson.gz          # 0efc17dfe5d14039457b22fb606eb12e74aa87d05c097c0cec4791a2e401d73c
+gzip -dc events.ndjson.gz > events.ndjson
+sha256sum events.ndjson             # cb2abec6e39c0acc6f180c5c0ab111a3ab8a3f8c4928427c6b03fc23f5002ca1
+npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay -- \
+  --in events.ndjson --out ./audit-repro --qty 0.500 --entry-bps-list 2,1 --delays-ms 0,100 --hl-max-age-ms-list 15000,10000,5000
+```
+
+至此第 16.2 节代码回归与原始 NDJSON 只读共享交付全部就绪，请评审团队校验并完成第 9.3 节最终验收；团队后续亦可按现有参数并行开展下一段样本外验证窗口。

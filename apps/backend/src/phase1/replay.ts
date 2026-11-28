@@ -389,6 +389,7 @@ export interface VariantCheckpoint {
   openPosition: OpenPositionState | null;
   metrics: VariantMetricsAccumulator;
   rows: TradeScorecardRow[];
+  deferredTriggeredRows?: TradeScorecardRow[];
 }
 
 export interface AgeTierCoverageCheckpoint {
@@ -1060,6 +1061,7 @@ export class StreamingReplayRunner {
   private bnInGapRecovery = false;
   private delaySampleRows: TradeScorecardRow[] = [];
   private totalRetainedRows = 0;
+  private inFinalizePass = false;
   private readonly options: StreamingReplayOptions;
 
   private readonly coverageTrackers: AgeTierCoverageCheckpoint[];
@@ -1097,15 +1099,33 @@ export class StreamingReplayRunner {
       this.hlStaleRejectedCount = checkpoint.hlStaleRejectedCount;
       this.crossexBypassCount = checkpoint.crossexBypassCount;
       this.bnInGapRecovery = checkpoint.bnInGapRecovery;
-      this.delaySampleRows = [...checkpoint.delaySampleRows];
+      this.delaySampleRows = checkpoint.delaySampleRows.map((r) => ({ ...r }));
       this.coverageTrackers = checkpoint.coverageTrackers.map((t) => ({ ...t }));
-      this.variants = checkpoint.variants.map((v) => ({
-        ...v,
-        rawRejectReasons: { ...v.rawRejectReasons },
-        metrics: { ...v.metrics },
-        openPosition: v.openPosition ? { ...v.openPosition, openRow: { ...v.openPosition.openRow } } : null,
-        rows: [...v.rows],
-      }));
+      this.variants = checkpoint.variants.map((v) => {
+        const rows = v.rows.map((r) => ({ ...r }));
+        const rowById = new Map(rows.map((r) => [r.opportunity_id, r]));
+        const sampleByKey = new Map(
+          this.delaySampleRows.map((r) => [
+            `${r.age_tier}|${r.entry_bps_threshold}|${r.strategy_version}|${r.delay_ms}|${r.opportunity_id}`,
+            r,
+          ]),
+        );
+        const deferredTriggeredRows = (v.deferredTriggeredRows ?? []).map((dr) => {
+          const linked = rowById.get(dr.opportunity_id)
+            ?? sampleByKey.get(
+              `${dr.age_tier}|${dr.entry_bps_threshold}|${dr.strategy_version}|${dr.delay_ms}|${dr.opportunity_id}`,
+            );
+          return linked ?? { ...dr };
+        });
+        return {
+          ...v,
+          rawRejectReasons: { ...v.rawRejectReasons },
+          metrics: { ...v.metrics },
+          openPosition: v.openPosition ? { ...v.openPosition, openRow: { ...v.openPosition.openRow } } : null,
+          rows,
+          deferredTriggeredRows,
+        };
+      });
       this.totalRetainedRows = this.variants.reduce((acc, v) => acc + v.rows.length, 0);
       return;
     }
@@ -1160,6 +1180,7 @@ export class StreamingReplayRunner {
         totalPlannedNotionalUsdt: '0',
       },
       rows: [],
+      deferredTriggeredRows: [],
     }));
   }
 
@@ -1200,6 +1221,7 @@ export class StreamingReplayRunner {
         metrics: { ...v.metrics },
         openPosition: v.openPosition ? { ...v.openPosition, openRow: { ...v.openPosition.openRow } } : null,
         rows: [...v.rows],
+        deferredTriggeredRows: [...(v.deferredTriggeredRows ?? [])],
       })),
     };
   }
@@ -1535,7 +1557,17 @@ export class StreamingReplayRunner {
     if (this.delaySampleRows.length < 300 || (row.decision === 'TRIGGERED' && this.delaySampleRows.length < 600)) {
       this.delaySampleRows.push(row);
     }
-    this.options.onFinalizedRow?.(row);
+
+    const deferForLateFunding = !this.hasPreloadedAccountingIndex
+      && !this.inFinalizePass
+      && row.decision === 'TRIGGERED'
+      && !row.is_open_at_end;
+    if (deferForLateFunding) {
+      variant.deferredTriggeredRows = variant.deferredTriggeredRows ?? [];
+      variant.deferredTriggeredRows.push(row);
+    } else {
+      this.options.onFinalizedRow?.(row);
+    }
 
     const retain = this.options.retainRowsInMemory !== false;
     const cap = this.options.maxRetainedRows ?? Number.POSITIVE_INFINITY;
@@ -1985,6 +2017,7 @@ export class StreamingReplayRunner {
   }
 
   finalize(): ReplaySuiteResult {
+    this.inFinalizePass = true;
     const finalTs = this.endedAtMs;
     for (const tracker of this.coverageTrackers) {
       advanceCoverageTo(tracker, finalTs);
@@ -2113,7 +2146,7 @@ export class StreamingReplayRunner {
         this.emitFinalizedRow(variant, targetRow);
       }
 
-      if (!this.hasPreloadedAccountingIndex && this.liveSettledFunding.length > 0) {
+      if (!this.hasPreloadedAccountingIndex) {
         this.reconcileClosedRowsFunding(variant);
       }
 
@@ -2207,40 +2240,37 @@ export class StreamingReplayRunner {
     };
   }
 
-  private reconcileClosedRowsFunding(variant: VariantCheckpoint): void {
+  private reconcileRowFunding(variant: VariantCheckpoint, row: TradeScorecardRow): void {
     const m = variant.metrics;
-    for (const row of variant.rows) {
-      if (
-        row.decision !== 'TRIGGERED'
-        || row.is_open_at_end
-        || row.exec_arrival_ts === null
-        || row.exit_exec_arrival_ts === null
-        || !row.exit_long_fill
-        || !row.exit_short_fill
-      ) {
-        continue;
-      }
-      const fallbackBnPriceUsdt = row.exit_long_fill.venue === 'BINANCE'
-        ? row.exit_long_fill.avgPriceNative
-        : row.exit_short_fill.avgPriceNative;
-      const fallbackHlPriceUsdc = row.exit_long_fill.venue === 'HYPERLIQUID'
-        ? row.exit_long_fill.avgPriceNative
-        : row.exit_short_fill.avgPriceNative;
-      const funding = computeFundingBreakdown({
-        liveSettledFunding: this.liveSettledFunding,
-        direction: row.direction,
-        qtyEth: row.planned_qty,
-        entryTs: row.exec_arrival_ts,
-        exitTs: row.exit_exec_arrival_ts,
-        fallbackBnPriceUsdt,
-        fallbackHlPriceUsdc,
-        fallbackFxRate: row.fx_usdc_usdt,
-        fallbackFxSource: row.fx_source,
-      });
-      const prevNet = row.funding_net_usd ?? '0';
-      if (funding.count === row.funding_events_crossed && funding.netUsd === prevNet) {
-        continue;
-      }
+    if (
+      row.decision !== 'TRIGGERED'
+      || row.is_open_at_end
+      || row.exec_arrival_ts === null
+      || row.exit_exec_arrival_ts === null
+      || !row.exit_long_fill
+      || !row.exit_short_fill
+    ) {
+      return;
+    }
+    const fallbackBnPriceUsdt = row.exit_long_fill.venue === 'BINANCE'
+      ? row.exit_long_fill.avgPriceNative
+      : row.exit_short_fill.avgPriceNative;
+    const fallbackHlPriceUsdc = row.exit_long_fill.venue === 'HYPERLIQUID'
+      ? row.exit_long_fill.avgPriceNative
+      : row.exit_short_fill.avgPriceNative;
+    const funding = computeFundingBreakdown({
+      liveSettledFunding: this.liveSettledFunding,
+      direction: row.direction,
+      qtyEth: row.planned_qty,
+      entryTs: row.exec_arrival_ts,
+      exitTs: row.exit_exec_arrival_ts,
+      fallbackBnPriceUsdt,
+      fallbackHlPriceUsdc,
+      fallbackFxRate: row.fx_usdc_usdt,
+      fallbackFxSource: row.fx_source,
+    });
+    const prevNet = row.funding_net_usd ?? '0';
+    if (funding.count !== row.funding_events_crossed || funding.netUsd !== prevNet) {
       const delta = new Decimal(funding.netUsd).minus(prevNet);
       row.funding_events_crossed = funding.count;
       row.funding_net_usd = funding.netUsd;
@@ -2263,6 +2293,35 @@ export class StreamingReplayRunner {
         .toString();
       m.totalFundingNetUsd = new Decimal(m.totalFundingNetUsd).plus(delta).toString();
       m.realizedPnlUsd = new Decimal(m.realizedPnlUsd).plus(delta).toString();
+    }
+  }
+
+  private reconcileClosedRowsFunding(variant: VariantCheckpoint): void {
+    const deferred = variant.deferredTriggeredRows ?? [];
+    if (deferred.length > 0) {
+      const retainedById = new Map(variant.rows.map((r) => [r.opportunity_id, r]));
+      const sampleByKey = new Map(
+        this.delaySampleRows.map((r) => [
+          `${r.age_tier}|${r.entry_bps_threshold}|${r.strategy_version}|${r.delay_ms}|${r.opportunity_id}`,
+          r,
+        ]),
+      );
+      for (const row of deferred) {
+        this.reconcileRowFunding(variant, row);
+        const retained = retainedById.get(row.opportunity_id);
+        if (retained && retained !== row) Object.assign(retained, row);
+        const sample = sampleByKey.get(
+          `${row.age_tier}|${row.entry_bps_threshold}|${row.strategy_version}|${row.delay_ms}|${row.opportunity_id}`,
+        );
+        if (sample && sample !== row) Object.assign(sample, row);
+        this.options.onFinalizedRow?.(row);
+      }
+      variant.deferredTriggeredRows = [];
+      return;
+    }
+
+    for (const row of variant.rows) {
+      this.reconcileRowFunding(variant, row);
     }
   }
 }
