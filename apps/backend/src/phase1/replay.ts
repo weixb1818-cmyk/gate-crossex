@@ -374,6 +374,14 @@ export interface StreamingReplayOptions {
   preloadedFundingSettlements?: readonly FundingSettledRecorded[];
 }
 
+export interface DeferredFundingRowEntry {
+  row: TradeScorecardRow;
+  fallbackBnPriceUsdt: string | null;
+  fallbackHlPriceUsdc: string | null;
+  fallbackFxRate: string;
+  fallbackFxSource: FxRateRecorded['source'];
+}
+
 export interface VariantCheckpoint {
   spec: VariantSpec;
   seq: number;
@@ -389,7 +397,7 @@ export interface VariantCheckpoint {
   openPosition: OpenPositionState | null;
   metrics: VariantMetricsAccumulator;
   rows: TradeScorecardRow[];
-  deferredTriggeredRows?: TradeScorecardRow[];
+  deferredTriggeredRows?: DeferredFundingRowEntry[];
 }
 
 export interface AgeTierCoverageCheckpoint {
@@ -1110,12 +1118,15 @@ export class StreamingReplayRunner {
             r,
           ]),
         );
-        const deferredTriggeredRows = (v.deferredTriggeredRows ?? []).map((dr) => {
-          const linked = rowById.get(dr.opportunity_id)
+        const deferredTriggeredRows = (v.deferredTriggeredRows ?? []).map((entry) => {
+          const linked = rowById.get(entry.row.opportunity_id)
             ?? sampleByKey.get(
-              `${dr.age_tier}|${dr.entry_bps_threshold}|${dr.strategy_version}|${dr.delay_ms}|${dr.opportunity_id}`,
+              `${entry.row.age_tier}|${entry.row.entry_bps_threshold}|${entry.row.strategy_version}|${entry.row.delay_ms}|${entry.row.opportunity_id}`,
             );
-          return linked ?? { ...dr };
+          return {
+            ...entry,
+            row: linked ?? { ...entry.row },
+          };
         });
         return {
           ...v,
@@ -1221,7 +1232,10 @@ export class StreamingReplayRunner {
         metrics: { ...v.metrics },
         openPosition: v.openPosition ? { ...v.openPosition, openRow: { ...v.openPosition.openRow } } : null,
         rows: [...v.rows],
-        deferredTriggeredRows: [...(v.deferredTriggeredRows ?? [])],
+        deferredTriggeredRows: (v.deferredTriggeredRows ?? []).map((entry) => ({
+          ...entry,
+          row: { ...entry.row },
+        })),
       })),
     };
   }
@@ -1520,7 +1534,11 @@ export class StreamingReplayRunner {
     this.emitFinalizedRow(variant, finalizedRow);
   }
 
-  private emitFinalizedRow(variant: VariantCheckpoint, row: TradeScorecardRow): void {
+  private emitFinalizedRow(
+    variant: VariantCheckpoint,
+    row: TradeScorecardRow,
+    exitFundingFallback?: Omit<DeferredFundingRowEntry, 'row'>,
+  ): void {
     const m = variant.metrics;
     m.loggedCandidates += 1;
     if (row.decision === 'TRIGGERED') {
@@ -1564,7 +1582,13 @@ export class StreamingReplayRunner {
       && !row.is_open_at_end;
     if (deferForLateFunding) {
       variant.deferredTriggeredRows = variant.deferredTriggeredRows ?? [];
-      variant.deferredTriggeredRows.push(row);
+      variant.deferredTriggeredRows.push({
+        row,
+        fallbackBnPriceUsdt: exitFundingFallback?.fallbackBnPriceUsdt ?? null,
+        fallbackHlPriceUsdc: exitFundingFallback?.fallbackHlPriceUsdc ?? null,
+        fallbackFxRate: exitFundingFallback?.fallbackFxRate ?? this.lastFx.rate,
+        fallbackFxSource: exitFundingFallback?.fallbackFxSource ?? this.lastFx.source,
+      });
     } else {
       this.options.onFinalizedRow?.(row);
     }
@@ -1767,6 +1791,10 @@ export class StreamingReplayRunner {
       .plus(pos.shortEntryFill.feeUsdt)
       .plus(execExit.longCloseFill.feeUsdt)
       .plus(execExit.shortCloseFill.feeUsdt);
+    const fallbackBnPriceUsdt = midpointFromView(bnCheck.view);
+    const fallbackHlPriceUsdc = midpointFromView(hlCheck.view);
+    const fallbackFxRate = this.lastFx.rate;
+    const fallbackFxSource = this.lastFx.source;
     const funding = computeFundingBreakdown({
       liveSettledFunding: this.hasPreloadedAccountingIndex
         ? this.accountingLiveSettlements
@@ -1775,10 +1803,10 @@ export class StreamingReplayRunner {
       qtyEth: this.config.plannedQtyEth,
       entryTs: pos.entryExecTs,
       exitTs: order.arrivalTs,
-      fallbackBnPriceUsdt: midpointFromView(bnCheck.view),
-      fallbackHlPriceUsdc: midpointFromView(hlCheck.view),
-      fallbackFxRate: this.lastFx.rate,
-      fallbackFxSource: this.lastFx.source,
+      fallbackBnPriceUsdt,
+      fallbackHlPriceUsdc,
+      fallbackFxRate,
+      fallbackFxSource,
     });
     const netPnl = new Decimal(pnl.contractSpreadPnlUsd).plus(funding.netUsd).minus(fees4);
     const netBps = netPnl.div(pos.plannedNotionalUsdt).mul(10_000).toDecimalPlaces(4);
@@ -1801,7 +1829,12 @@ export class StreamingReplayRunner {
     targetRow.budget_roi_pct = roiPct.toString();
     targetRow.is_open_at_end = false;
     variant.openPosition = null;
-    this.emitFinalizedRow(variant, targetRow);
+    this.emitFinalizedRow(variant, targetRow, {
+      fallbackBnPriceUsdt,
+      fallbackHlPriceUsdc,
+      fallbackFxRate,
+      fallbackFxSource,
+    });
   }
 
   private evaluateVariantAtTick(
@@ -2240,7 +2273,11 @@ export class StreamingReplayRunner {
     };
   }
 
-  private reconcileRowFunding(variant: VariantCheckpoint, row: TradeScorecardRow): void {
+  private reconcileRowFunding(
+    variant: VariantCheckpoint,
+    row: TradeScorecardRow,
+    exitFallback?: Omit<DeferredFundingRowEntry, 'row'>,
+  ): void {
     const m = variant.metrics;
     if (
       row.decision !== 'TRIGGERED'
@@ -2252,12 +2289,18 @@ export class StreamingReplayRunner {
     ) {
       return;
     }
-    const fallbackBnPriceUsdt = row.exit_long_fill.venue === 'BINANCE'
-      ? row.exit_long_fill.avgPriceNative
-      : row.exit_short_fill.avgPriceNative;
-    const fallbackHlPriceUsdc = row.exit_long_fill.venue === 'HYPERLIQUID'
-      ? row.exit_long_fill.avgPriceNative
-      : row.exit_short_fill.avgPriceNative;
+    const fallbackBnPriceUsdt = exitFallback
+      ? exitFallback.fallbackBnPriceUsdt
+      : row.exit_long_fill.venue === 'BINANCE'
+        ? row.exit_long_fill.avgPriceNative
+        : row.exit_short_fill.avgPriceNative;
+    const fallbackHlPriceUsdc = exitFallback
+      ? exitFallback.fallbackHlPriceUsdc
+      : row.exit_long_fill.venue === 'HYPERLIQUID'
+        ? row.exit_long_fill.avgPriceNative
+        : row.exit_short_fill.avgPriceNative;
+    const fallbackFxRate = exitFallback?.fallbackFxRate ?? row.fx_usdc_usdt;
+    const fallbackFxSource = exitFallback?.fallbackFxSource ?? row.fx_source;
     const funding = computeFundingBreakdown({
       liveSettledFunding: this.liveSettledFunding,
       direction: row.direction,
@@ -2266,8 +2309,8 @@ export class StreamingReplayRunner {
       exitTs: row.exit_exec_arrival_ts,
       fallbackBnPriceUsdt,
       fallbackHlPriceUsdc,
-      fallbackFxRate: row.fx_usdc_usdt,
-      fallbackFxSource: row.fx_source,
+      fallbackFxRate,
+      fallbackFxSource,
     });
     const prevNet = row.funding_net_usd ?? '0';
     if (funding.count !== row.funding_events_crossed || funding.netUsd !== prevNet) {
@@ -2306,8 +2349,14 @@ export class StreamingReplayRunner {
           r,
         ]),
       );
-      for (const row of deferred) {
-        this.reconcileRowFunding(variant, row);
+      for (const entry of deferred) {
+        const { row } = entry;
+        this.reconcileRowFunding(variant, row, {
+          fallbackBnPriceUsdt: entry.fallbackBnPriceUsdt,
+          fallbackHlPriceUsdc: entry.fallbackHlPriceUsdc,
+          fallbackFxRate: entry.fallbackFxRate,
+          fallbackFxSource: entry.fallbackFxSource,
+        });
         const retained = retainedById.get(row.opportunity_id);
         if (retained && retained !== row) Object.assign(retained, row);
         const sample = sampleByKey.get(

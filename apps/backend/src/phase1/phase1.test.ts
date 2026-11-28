@@ -1709,4 +1709,144 @@ describe('Phase 1 Section 16.2 streaming & mid-bridge checkpoint regressions', (
       }
     }
   });
+
+  it('uses identical midpoint fallback reference when settlement markPrice is null across file/preloaded and direct streaming paths under early/late arrival', async () => {
+    const makeEvents = (fundingRecvTs: number): RecordedMarketEvent[] => [
+      { type: 'fx_rate', recvSeq: 1, recvTs: 900, pair: 'USDC_USDT', rate: '1', source: 'parity_fallback' },
+      { type: 'conn_event', venue: 'BINANCE', connGen: 1, recvSeq: 2, recvTs: 1000, status: 'open', url: 'bn' },
+      { type: 'conn_event', venue: 'HYPERLIQUID', connGen: 1, recvSeq: 3, recvTs: 1000, status: 'open', url: 'hl' },
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 4,
+        recvTs: 1000,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1000,
+        U: '100',
+        u: '100',
+        pu: '99',
+        bids: [['99.90', '5']],
+        asks: [['100.00', '5']],
+      },
+      {
+        type: 'bn_depth_snapshot',
+        connGen: 1,
+        recvSeq: 5,
+        recvTs: 1000,
+        lastUpdateId: '100',
+        bids: [['99.90', '5']],
+        asks: [['100.00', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 6,
+        recvTs: 1030,
+        sourceTs: 1025,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['101.00', '5']],
+        asks: [['101.10', '5']],
+      },
+      // Exit book on Binance is 99.95 / 100.00 -> midpoint 99.975 (sell fill is 99.95).
+      {
+        type: 'bn_depth_delta',
+        connGen: 1,
+        recvSeq: 7,
+        recvTs: 1140,
+        stream: 'ethusdt@depth@100ms',
+        eventTime: 1138,
+        U: '101',
+        u: '101',
+        pu: '100',
+        bids: [['99.95', '5'], ['99.90', '0']],
+        asks: [['100.00', '5']],
+      },
+      {
+        type: 'hl_l2book',
+        connGen: 1,
+        recvSeq: 8,
+        recvTs: 1150,
+        sourceTs: 1148,
+        coin: 'ETH',
+        bidLevels: 1,
+        askLevels: 1,
+        bids: [['99.90', '5']],
+        asks: [['99.95', '5']],
+      },
+      {
+        type: 'funding_settled',
+        venue: 'BINANCE',
+        recvSeq: 9,
+        recvTs: fundingRecvTs,
+        source: 'bn_funding_rate_api',
+        symbol: 'ETHUSDT',
+        settlementTime: 1050,
+        isHistoricalBackfill: false,
+        fundingRate: '0.001',
+        markPrice: null,
+        premium: null,
+        nearestOraclePriceUsdc: null,
+        nearestOraclePriceTs: null,
+        nearestFxUsdcUsdt: null,
+        nearestFxTs: null,
+        nearestFxSource: null,
+      },
+    ];
+
+    const cfg = {
+      plannedQtyEth: '1',
+      entryBpsList: ['2'],
+      hlMaxAgeMsList: [15_000],
+      takeProfitBps: '0',
+      delaysMs: [0],
+      cooldownBetweenRejectsMs: 0,
+    };
+
+    const earlyEvents = makeEvents(1080);
+    const lateEvents = makeEvents(1220);
+
+    const fileEarly = runPhase1Replay(earlyEvents, cfg);
+    const fileLate = runPhase1Replay(lateEvents, cfg);
+
+    const directLateStreamed: ReturnType<typeof runPhase1Replay>['rows'] = [];
+    const directLateRunner = new StreamingReplayRunner(cfg, undefined, {
+      retainRowsInMemory: false,
+      onFinalizedRow: (r) => directLateStreamed.push(r),
+    });
+    for (const ev of lateEvents) directLateRunner.processEvent(ev);
+    const directLate = directLateRunner.finalize();
+
+    const directEarlyStreamed: ReturnType<typeof runPhase1Replay>['rows'] = [];
+    const directEarlyRunner = new StreamingReplayRunner(cfg, undefined, {
+      retainRowsInMemory: false,
+      onFinalizedRow: (r) => directEarlyStreamed.push(r),
+    });
+    for (const ev of earlyEvents) directEarlyRunner.processEvent(ev);
+    const directEarly = directEarlyRunner.finalize();
+
+    expect(fileLate.summaries).toEqual(fileEarly.summaries);
+    expect(directEarly.summaries).toEqual(fileEarly.summaries);
+    expect(directLate.summaries).toEqual(fileEarly.summaries);
+
+    for (const rows of [
+      fileEarly.rows.filter((r) => r.decision === 'TRIGGERED'),
+      fileLate.rows.filter((r) => r.decision === 'TRIGGERED'),
+      directEarlyStreamed.filter((r) => r.decision === 'TRIGGERED'),
+      directLateStreamed.filter((r) => r.decision === 'TRIGGERED'),
+    ]) {
+      expect(rows).toHaveLength(2);
+      for (const r of rows) {
+        expect(r.funding_net_usd).toBe('-0.099975');
+        expect(r.funding_legs).toHaveLength(1);
+        expect(r.funding_legs[0]).toMatchObject({
+          venue: 'BINANCE',
+          refPriceNative: '99.975',
+          priceSource: 'book_mid_fallback',
+          cashflowUsdt: '-0.099975',
+        });
+      }
+    }
+  });
 });

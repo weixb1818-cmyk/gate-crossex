@@ -560,3 +560,10 @@ npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay 
 **后续处理缺少参考价的结算时，应统一两个入口的估算依据。** 将回归样本的 Binance 结算标记价置空，令平仓盘口为 `99.95 / 100.00`。文件回放使用中间价 99.975，1 ETH 多仓按 0.001 费率记 −0.099975 USDT。直接流式回放在期末核账时使用卖出成交价 99.95，记 −0.099950 USDT，两个入口却都标为 `book_mid_fallback`。建议在待核账记录中保留同一参考价、汇率和来源，并校验早到及迟到两种次序下的逐腿结果。本次 10 条实时结算的所需参考值全部齐备。[文件回放的平仓估算](../apps/backend/src/phase1/replay.ts#L1778) · [直接流式回放的期末核账](../apps/backend/src/phase1/replay.ts#L2255)
 
 未预载结算索引时，直接回放器会把已闭环成交保留到期末再发回调，其内存需求随闭环笔数增长。长文件继续使用本轮验收的 CLI 入口，其预扫描结算索引后即可逐笔输出。[回调时机](../apps/backend/src/phase1/replay.ts#L1561)
+
+## 十九、第 18.2 节 `markPrice` 缺失回退参考价统一修正（2026-11-28）
+
+已按第 18.2 节要求统一文件回放与直接流式回放的缺失参考价回退逻辑（[replay.ts](../apps/backend/src/phase1/replay.ts)）：
+
+* **修复内容**：`executePendingOrder` 平仓时刻将 `midpointFromView(bnCheck.view)`、`midpointFromView(hlCheck.view)`、`fxRate` 与 `fxSource` 一并存入待核账记录（`DeferredFundingRowEntry`），跨断点持久化还原；`reconcileRowFunding` 期末对账不再使用 `exit_long_fill.avgPriceNative` 替代中间价。
+* **回归证明**（[phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts#L1708-L1844)）：构造 `markPrice: null`、平仓盘口 `99.95 / 100.00` 的 1 ETH 样本，在早到（`1080`）与迟到（`1220`）两种输入下，文件回放与直接流式回放（`retainRowsInMemory: false`）均一致按 `99.975`（`book_mid_fallback`）计提 `-0.099975 USDT`，全部后端 `17` 个测试文件 **`243/243` 通过**（含一期 `19/19`）、`tsc --noEmit` 与 `eslint` 零报错通过。
