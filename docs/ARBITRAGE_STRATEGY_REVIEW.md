@@ -661,7 +661,7 @@ npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay 
 
 ### 23.2 账户 VIP0 状态与费率待核口径确认
 
-* **现状说明**：业务方确认当前 CrossEx 正式账号尚未开启交易、无任何 VIP 等级（普通 VIP 0 账号）。依据 CrossEx 官方计费规则及第 21.2 节要求，普通 VIP 0 账号在不同接入场所的实际费率（含场所基础费率与 `specialFees` 配置）仍以开户激活后经 `/api/v4/crossex/fee`（`queryFeeRates`）查询所得实时合同费率为准，不能直接等同于回放默认使用的原生场所 VIP 0 回退假设（Binance `0.0005` / Hyperliquid `0.00045`）。
+* **现状说明**：业务方确认当前 CrossEx 正式账号尚未开启交易、无任何 VIP 等级（普通 VIP 0 账号），且 Gate CrossEx 官方唯一的费率文档（[49701](https://www.gate.com/zh/help/crossex/functional/49701)）本身不公布各 VIP 档位的静态费率数字表，仅明确交易量可跨平台合并计算、实际合约费率需以开户后调用 `/api/v4/crossex/fee`（对应 [`queryFeeRates`](../apps/backend/src/crossex-client.ts)）实时返回结果为准。因此回放默认的原生场所 VIP 0 回退假设（Binance `0.0005` / Hyperliquid `0.00045`）仍按假设单列，账户实测费率保持 `pending` 等待只读凭证拉取。
 * **后续衔接**：24h 样本外录盘继续后台运行（`PID 3108038`，截至 `18:07+08:00` 已写入 `142,712` 行、`107M`）；待账号启用并取得只读凭证/脱敏费率快照后，即利用已就绪的 `--fee-snapshot` / `--compare-fee-snapshot` 能力，在同一窗口上输出 VIP 0 回退假设与 CrossEx 实测 VIP 0 账户费率的双口径对照，并在必要时同步补充 Maker+IOC 影子对比场景。
 
 ### 23.3 送审基线（`34c9124`）、第 21.4 节逐项对照与复现命令
