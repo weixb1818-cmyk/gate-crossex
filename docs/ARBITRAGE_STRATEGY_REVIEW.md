@@ -662,4 +662,32 @@ npm run build -w apps/backend && npm --workspace apps/backend run phase1:replay 
 ### 23.2 账户 VIP0 状态与费率待核口径确认
 
 * **现状说明**：业务方确认当前 CrossEx 正式账号尚未开启交易、无任何 VIP 等级（普通 VIP 0 账号）。依据 CrossEx 官方计费规则及第 21.2 节要求，普通 VIP 0 账号在不同接入场所的实际费率（含场所基础费率与 `specialFees` 配置）仍以开户激活后经 `/api/v4/crossex/fee`（`queryFeeRates`）查询所得实时合同费率为准，不能直接等同于回放默认使用的原生场所 VIP 0 回退假设（Binance `0.0005` / Hyperliquid `0.00045`）。
-* **后续衔接**：24h 样本外录盘继续后台运行（`PID 3108038`，当前已写入 60,417+ 行）；待账号启用并取得只读凭证/脱敏费率快照后，即利用已就绪的 `--fee-snapshot` / `--compare-fee-snapshot` 能力，在同一窗口上输出 VIP 0 回退假设与 CrossEx 实测 VIP 0 账户费率的双口径对照，并在必要时同步补充 Maker+IOC 影子对比场景。
+* **后续衔接**：24h 样本外录盘继续后台运行（`PID 3108038`，截至 `18:07+08:00` 已写入 `142,712` 行、`107M`）；待账号启用并取得只读凭证/脱敏费率快照后，即利用已就绪的 `--fee-snapshot` / `--compare-fee-snapshot` 能力，在同一窗口上输出 VIP 0 回退假设与 CrossEx 实测 VIP 0 账户费率的双口径对照，并在必要时同步补充 Maker+IOC 影子对比场景。
+
+### 23.3 送审基线（`34c9124`）、第 21.4 节逐项对照与复现命令
+
+请评审团队按以下逐条映射表核验本轮并行交付（代码基线 `34c9124`），并可在任意环境直接运行复现命令：
+
+| 第 21.4 节验收项 | 本轮交付状态 | 代码证据与实测边界 |
+| --- | --- | --- |
+| **行情与订单路由**（直连盘口校验、CrossEx 可比偏离冻结、现网实盘未动） | **离线模块与单测已就绪；现网未切流** | [native-market-adapter.ts](../apps/backend/src/phase2/native-market-adapter.ts) 覆盖合约目录、断连/缺口、双时间戳、深度、`FX` 与 `cx_raw` 偏离；[strategy-engine.ts](../apps/backend/src/strategy-engine.ts#L764) 实盘逻辑未改动 |
+| **订单语义与延迟**（`LIMIT+IOC` 保护价、`POC`、`reduce_only`、`MARKET+IOC` 单列、5 段时间戳、模拟故障覆盖） | **影子构造与模拟故障单测已通过；真实发单 RTT 待获批试单测量** | [shadow-gateway.ts](../apps/backend/src/phase2/shadow-gateway.ts) · [shadow-runner.ts](../apps/backend/src/phase2/shadow-runner.ts) 覆盖零成交、部分成交 + `reduce_only` 减平、撤单期迟到成交及真实 `TradingRuntime` 的 `504` 超时恢复与 `quiesceOpenOrders` |
+| **共享保证金与少人值守**（并发预留/释放、护栏减险、重启对账、独立资金费路径；实盘只读账户待核） | **模拟并发/护栏/对账与资金费评估已通过；CrossEx 只读账户核对 `pending`** | [shared-margin-coordinator.ts](../apps/backend/src/phase2/shared-margin-coordinator.ts) · `evaluateFundingStrategyPathComparison`；真实账户权益/抵押/负债字段映射待只读凭证到位后实盘采集核对 |
+| **极小额真单门槛** | **严格锁定未放行** | `DEFAULT_SHADOW_RISK_LIMITS.liveOpenNotionalCapUsd = '0'` 强拒一切 `mode === 'LIVE'` 资金预留 |
+
+评审团队本地独立复现命令：
+
+```bash
+npm --workspace apps/backend exec -- tsc --noEmit \
+  && npx eslint apps/backend/src/phase2/*.ts \
+  && npm run build -w apps/backend \
+  && npm --workspace apps/backend test
+```
+
+（2026-11-28 实测全量通过：**`18/18` 测试文件、`256/256` 项测试通过**，其中 [phase2.test.ts](../apps/backend/src/phase2/phase2.test.ts) `11/11`、[phase1.test.ts](../apps/backend/src/phase1/phase1.test.ts) `21/21`。）
+
+### 23.4 请评审与业务方确认的阶段性问题（等待 24h 录盘完成期间）
+
+1. **阶段代码先审确认**：请审计确认提交 `34c9124` 的 Phase 2 直连适配器、CrossEx 订单语义校验、共享保证金并发/护栏及模拟网关故障用例是否通过本轮阶段复核，以便在 24 小时录盘收口前消除执行层结构性问题。
+2. **VIP 0 费率就绪时序确认**：截至当前，业务方 CrossEx 正式账号尚未开启交易且为普通 VIP 0（无只读 API 凭证）。若到 `2026-11-29T09:25:29Z`（24h 样本外录盘结束）时账号仍未激活：是否允许开发团队按第 21.2 节先交付**原生 VIP 0 回退假设下的 24h 全量与逐时基线报告**（账户费率栏明确标为 `pending`）并同步附带敏感度 / Maker+IOC 影子分析，待后续只读 Key 就位后再补充 `--compare-fee-snapshot` 双费率对照？
+3. **后续极小额真单风控默认值复核（当前仍锁定 `liveOpenNotionalCapUsd = '0'`）**：[shared-margin-coordinator.ts](../apps/backend/src/phase2/shared-margin-coordinator.ts#L37) 当前暂置的影子/试错默认值（`shadowAccountBudgetUsd = 2000`、`maxPairNotionalUsd = 2000`、`maxOrderNotionalUsd = 1000`、`maxLeverage = 5`、`minAvailableMarginBufferRatio = 0.15`、`maxNakedNotionalUsd = 1000`、`maxNakedDurationMs = 5000ms`、`maxTrialLossUsd = 25`）仅作代码回归使用；待 24h 样本外与实际 VIP 0 费率复核后如拟讨论试单，请业务与审计届时指定正式实拨限额与停机负责人。
